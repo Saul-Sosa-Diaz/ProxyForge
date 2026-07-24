@@ -54,9 +54,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="TCG strategy to apply for image fetching.",
     )
     parser.add_argument(
-        "--local-db",
-        default=None,
-        help="Optional path to the local JSON card database (Lorcana only).",
+        "--db-cache",
+        default="data/lorcana_cache.json",
+        help="Path to the LorcanaJSON cache file (Lorcana only). Auto-created on first run.",
+    )
+    parser.add_argument(
+        "--refresh-db",
+        action="store_true",
+        help="Force re-download of the LorcanaJSON database, ignoring the local cache.",
     )
     parser.add_argument(
         "--verbose",
@@ -73,12 +78,15 @@ _STRATEGY_REGISTRY: dict[str, type[TCGStrategy]] = {
 }
 
 
-def _make_strategy(name: str, local_db: str | None) -> TCGStrategy:
+def _make_strategy(name: str, db_cache: str | None, refresh_db: bool) -> TCGStrategy:
     cls = _STRATEGY_REGISTRY.get(name)
     if cls is None:
         raise ValueError(f"Unknown TCG strategy: {name}")
-    if cls is LorcanaStrategy and local_db:
-        return LorcanaStrategy(local_db_path=local_db)
+    if cls is LorcanaStrategy:
+        return LorcanaStrategy(
+            cache_path=db_cache,
+            refresh_db=refresh_db,
+        )
     return cls()
 
 
@@ -102,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Parsed deck '%s' with %d unique card entries.", deck_name, len(cards))
 
     try:
-        strategy = _make_strategy(args.tcg, args.local_db)
+        strategy = _make_strategy(args.tcg, args.db_cache, args.refresh_db)
     except ValueError as exc:
         logger.error("%s", exc)
         return 2
