@@ -28,37 +28,6 @@ alongside a print-ready PDF configured to exact physical card dimensions
 
 ---
 
-## Project Structure
-
-```text
-.
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── README.md
-├── data/
-│   └── lorcana_cache.json      # auto-cached LorcanaJSON database
-├── input/
-│   └── my_awesome_deck.txt
-├── output/
-│   └── my_awesome_deck/
-│       ├── images/
-│       └── my_awesome_deck_printable.pdf
-└── src/
-    ├── __init__.py
-    ├── main.py
-    ├── parser.py
-    ├── models.py
-    ├── exporter.py
-    └── strategies/
-        ├── __init__.py
-        ├── base.py
-        ├── lorcana.py
-        └── mtg.py
-```
-
----
-
 ## Input Format
 
 Each non-empty line of the deck file must follow:
@@ -70,10 +39,23 @@ Each non-empty line of the deck file must follow:
 Example (`input/my_awesome_deck.txt`):
 
 ```text
-2 Mickey Mouse - Steamboat Pilot
-4 Develop Your Brain
-4 Mickey Mouse - Detective
-4 Scrooge McDuck - Reformed Ebenezer
+4 Daisy Duck - Donald's Date
+2 Emerald Chromicon
+4 Lilo - Escape Artist
+4 Tramp - Enterprising Dog
+4 Tramp - Street-Smart Dog
+4 Lady - Decisive Dog
+4 Bobby Zimuruski - Spray Cheese Kid
+2 Under the Sea
+4 Mowgli - Man Cub
+4 Grandmother Willow - Ancient Advisor
+4 Mulan - Resourceful Recruit
+2 Pluto - Friendly Pooch
+4 Lilo - Snow Artist
+4 Pudge - Controls the Weather
+4 Stitch - Naughty Experiment
+2 Lilo - Rock Star
+4 Stitch - Rock Star
 ```
 
 The deck file's base name (without extension) automatically becomes the output
@@ -96,7 +78,7 @@ To process a different deck, override the command:
 
 ```bash
 docker compose run --rm tcg-downloader \
-  src/main.py --input /app/input/my_deck.txt --tcg lorcana
+  src/main.py --input ./input/my_deck.txt --tcg lorcana
 ```
 
 ### Option B — Local Python
