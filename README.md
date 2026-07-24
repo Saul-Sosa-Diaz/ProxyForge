@@ -1,10 +1,21 @@
-# TCG Card Image Downloader
+<div align="center">
 
-I give up... it is to expensive to play TCGs and I want to print my own cards. This project is a simple Python application that parses standard TCG (Trading Card Game) decklists, fetches high-resolution card images. 
+# 🃏 ProxyForge
 
-**DON'T JUDGE ME I AM JUST POOR :(**
+**Stop paying $5 for a piece of cardboard. Print your own deck.**
 
-A containerized Python application that parses standard TCG (Trading Card Game)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![License](https://img.shields.io/badge/license-MIT-green)](#license)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](#contributing)
+
+</div>
+
+---
+
+> **⚠️ Disclaimer:** TCGs are stupidly expensive, and this project was born out of poverty, not spite toward publishers. Use it for playtest proxies, not for selling counterfeits. **Don't judge me.** 🥲
+
+A containerized Python application that parses standard **Trading Card Game**
 decklists, fetches high-resolution card images using a **Strategy Pattern**,
 de-duplicates the collection, and emits assets into a dedicated deck subfolder
 alongside a print-ready PDF configured to exact physical card dimensions
@@ -12,23 +23,36 @@ alongside a print-ready PDF configured to exact physical card dimensions
 
 ---
 
-## Features
+## 📚 Table of Contents
 
-- Standard decklist parsing (`<quantity> <full card name>`).
-- Pluggable **Strategy Pattern** for multi-TCG image fetching:
-  - **Lorcana** — queries the **LorcanaJSON** API
-    (`https://lorcanajson.org/files/current/en/allCards.json.zip`), caches it
-    locally for fast subsequent lookups, and falls back to `lorcana.gg` web
-    scraping for any card not present in the database.
-  - **MTG** — stub ready for Scryfall API integration.
-- De-duplicated image downloads (each unique card is fetched once).
-- Dynamic output subfolder named after the deck file.
-- Print-ready multi-page PDF grid (A4) at **800 DPI** with crop marks around
-  every 64 x 89 mm card slot.
+- [Features](#-features)
+- [Input Format](#-input-format)
+- [Usage](#-usage)
+- [CLI Arguments](#-cli-arguments)
+- [Output](#-output)
+- [LorcanaJSON Database & Cache](#-lorcanajson-database--cache-lorcana)
+- [Print Dimensions](#-print-dimensions)
+- [Roadmap](#-roadmap)
+- [Contributing](#-contributing)
+- [License](#-license)
 
 ---
 
-## Input Format
+## ✨ Features
+
+| | |
+|---|---|
+| 📝 **Standard parsing** | Reads decklists in `<quantity> <full card name>` format |
+| 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
+| 🃏 **Lorcana** | Queries the **LorcanaJSON** API, caches locally, and falls back to scraping `lorcana.gg` |
+| 🔮 **Magic: The Gathering** | Stub ready for Scryfall API integration |
+| ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
+| 📁 **Auto-organization** | Output subfolder named after the deck file |
+| 🖨️ **Print-ready PDF** | Multi-page A4 grid at **800 DPI** with crop marks around every 64 x 89 mm card slot |
+
+---
+
+## 📋 Input Format
 
 Each non-empty line of the deck file must follow:
 
@@ -36,7 +60,7 @@ Each non-empty line of the deck file must follow:
 <quantity> <full card name>
 ```
 
-Example (`input/my_awesome_deck.txt`):
+**Example** (`input/my_awesome_deck.txt`):
 
 ```text
 4 Daisy Duck - Donald's Date
@@ -58,14 +82,15 @@ Example (`input/my_awesome_deck.txt`):
 4 Stitch - Rock Star
 ```
 
-The deck file's base name (without extension) automatically becomes the output
-subfolder name (e.g. `my_awesome_deck.txt` -> `output/my_awesome_deck/`).
+> 💡 The deck file's base name (without extension) automatically becomes the
+> output subfolder name.
+> E.g. `my_awesome_deck.txt` → `output/my_awesome_deck/`
 
 ---
 
-## Usage
+## 🚀 Usage
 
-### Option A — Docker Compose (recommended)
+### Option A — Docker Compose *(recommended)*
 
 ```bash
 docker compose run --rm tcg-downloader
@@ -90,7 +115,9 @@ pip install -r requirements.txt
 python src/main.py --input input/my_awesome_deck.txt --output output --tcg lorcana
 ```
 
-### CLI Arguments
+---
+
+## ⚙️ CLI Arguments
 
 | Flag | Short | Default | Description |
 | --- | --- | --- | --- |
@@ -103,7 +130,7 @@ python src/main.py --input input/my_awesome_deck.txt --output output --tcg lorca
 
 ---
 
-## Output
+## 📦 Output
 
 For a deck file named `my_awesome_deck.txt`, the application produces:
 
@@ -119,7 +146,7 @@ clean physical trimming after printing.
 
 ---
 
-## LorcanaJSON Database & Cache (Lorcana)
+## 🗄️ LorcanaJSON Database & Cache (Lorcana)
 
 On the first run the Lorcana strategy downloads the full card database from
 **LorcanaJSON** (`https://lorcanajson.org/files/current/en/allCards.json.zip`)
@@ -148,7 +175,7 @@ not present in the LorcanaJSON database, the strategy falls back to scraping
 
 ---
 
-## Print Dimensions
+## 🖨️ Print Dimensions
 
 | Property | Value |
 | --- | --- |
@@ -157,3 +184,18 @@ not present in the LorcanaJSON database, the strategy falls back to scraping
 | Card pixels (at 800 DPI) | ~2016 x 2800 px |
 | Page size | A4 (210 x 297 mm) |
 | Grid | 3 x 3 (9 cards per page) |
+
+---
+
+## 🤝 Contributing
+
+PRs are welcome. If you want to add support for a new TCG, implement a new
+strategy following the existing interface in `src/strategies/` and open a
+pull request.
+
+---
+
+## 📄 License
+
+This project is distributed under the MIT License. Use it, modify it, and
+share it freely — but remember to respect each publisher's image rights.
