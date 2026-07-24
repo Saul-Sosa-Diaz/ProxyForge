@@ -1,5 +1,9 @@
 # TCG Card Image Downloader
 
+I give up... it is to expensive to play TCGs and I want to print my own cards. This project is a simple Python application that parses standard TCG (Trading Card Game) decklists, fetches high-resolution card images. 
+
+**DON'T JUDGE ME I AM JUST POOR :(**
+
 A containerized Python application that parses standard TCG (Trading Card Game)
 decklists, fetches high-resolution card images using a **Strategy Pattern**,
 de-duplicates the collection, and emits assets into a dedicated deck subfolder
@@ -171,7 +175,3 @@ not present in the LorcanaJSON database, the strategy falls back to scraping
 | Card pixels (at 800 DPI) | ~2016 x 2800 px |
 | Page size | A4 (210 x 297 mm) |
 | Grid | 3 x 3 (9 cards per page) |
-| Margins | 5 mm (block centered) |
-| Card gap (gutter for crop marks) | 3 mm |
-| Crop mark length | 3 mm |
-| Crop mark offset from card | 1 mm |
