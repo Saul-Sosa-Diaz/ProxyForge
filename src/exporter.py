@@ -17,12 +17,12 @@ CARD_WIDTH_MM = 64.0
 CARD_HEIGHT_MM = 89.0
 
 # Print resolution.
-PRINT_DPI = 300
+PRINT_DPI = 800
 MM_PER_INCH = 25.4
 
-# Card pixel size at the default 300 DPI (64x89 mm -> ~755x1051 px).
-CARD_WIDTH_PX = round(CARD_WIDTH_MM * PRINT_DPI / MM_PER_INCH)   # 756
-CARD_HEIGHT_PX = round(CARD_HEIGHT_MM * PRINT_DPI / MM_PER_INCH)  # 1051
+# Card pixel size at the default 800 DPI (64x89 mm -> ~1989x2797 px).
+CARD_WIDTH_PX = round(CARD_WIDTH_MM * PRINT_DPI / MM_PER_INCH)   # 1989
+CARD_HEIGHT_PX = round(CARD_HEIGHT_MM * PRINT_DPI / MM_PER_INCH)  # 2797
 
 # Crop mark geometry (all in millimetres, converted to pixels at render time).
 CROP_MARK_LEN_MM = 3.0        # length of each crop-mark tick
@@ -34,7 +34,7 @@ CROP_MARK_COLOR = (0, 0, 0)
 PAGE_WIDTH_MM = 210.0
 PAGE_HEIGHT_MM = 297.0
 PAGE_MARGIN_MM = 10.0
-CARD_GAP_MM = 8.0  # spacing between adjacent card slots (room for crop marks)
+CARD_GAP_MM = 0.0  # spacing between adjacent card slots (room for crop marks)
 
 
 class Exporter:
@@ -42,7 +42,7 @@ class Exporter:
 
     The PDF is rendered as a high-resolution raster at ``target_dpi`` so that
     each 64x89 mm card slot measures exactly ``CARD_WIDTH_PX x CARD_HEIGHT_PX``
-    pixels (e.g. 756x1051 px at 300 DPI). When Pillow saves the page with
+    pixels (e.g. 1989x2797 px at 800 DPI). When Pillow saves the page with
     ``resolution=target_dpi`` the resulting MediaBox is the true physical page
     size (A4 = 595x842 pt), so every card prints at exactly 64x89 mm.
     """

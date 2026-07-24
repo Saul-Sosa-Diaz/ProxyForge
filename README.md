@@ -12,12 +12,14 @@ alongside a print-ready PDF configured to exact physical card dimensions
 
 - Standard decklist parsing (`<quantity> <full card name>`).
 - Pluggable **Strategy Pattern** for multi-TCG image fetching:
-  - **Lorcana** — local JSON database (`data/lorcana.json`) with a
-    `lorcana.gg` web-scraping fallback.
+  - **Lorcana** — queries the **LorcanaJSON** API
+    (`https://lorcanajson.org/files/current/en/allCards.json.zip`), caches it
+    locally for fast subsequent lookups, and falls back to `lorcana.gg` web
+    scraping for any card not present in the database.
   - **MTG** — stub ready for Scryfall API integration.
 - De-duplicated image downloads (each unique card is fetched once).
 - Dynamic output subfolder named after the deck file.
-- Print-ready multi-page PDF grid (A4) at **300 DPI** with crop marks around
+- Print-ready multi-page PDF grid (A4) at **800 DPI** with crop marks around
   every 64 x 89 mm card slot.
 
 ---
@@ -31,7 +33,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 ├── requirements.txt
 ├── README.md
 ├── data/
-│   └── lorcana.json            # optional local card database
+│   └── lorcana_cache.json      # auto-cached LorcanaJSON database
 ├── input/
 │   └── my_awesome_deck.txt
 ├── output/
@@ -109,7 +111,8 @@ python src/main.py --input input/my_awesome_deck.txt --output output --tcg lorca
 | `--input` | `-i` | _required_ | Path to the standard `.txt` deck file. |
 | `--output` | `-o` | `/app/output` | Base output directory. |
 | `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `mtg`). |
-| `--local-db` | | _none_ | Optional path to the local JSON card DB (Lorcana). |
+| `--db-cache` | | `data/lorcana_cache.json` | Path to the LorcanaJSON cache file (Lorcana only). Auto-created on first run. |
+| `--refresh-db` | | off | Force re-download of the LorcanaJSON database, ignoring the cache. |
 | `--verbose` | `-v` | off | Enable verbose logging. |
 
 ---
@@ -130,26 +133,32 @@ clean physical trimming after printing.
 
 ---
 
-## Local JSON Database (Lorcana)
+## LorcanaJSON Database & Cache (Lorcana)
 
-Place a `data/lorcana.json` file at the project root (or pass its path via
-`--local-db`). The file may be either a JSON array of card objects or an
-object with a `cards` (or `data`) array. Each entry must contain at least
-`name` and an image URL field (`image_url` or `image`):
+On the first run the Lorcana strategy downloads the full card database from
+**LorcanaJSON** (`https://lorcanajson.org/files/current/en/allCards.json.zip`)
+and saves it to `data/lorcana_cache.json` (override with `--db-cache`).
+Subsequent runs load the cache instantly instead of re-downloading.
+
+Each card in the cache follows the LorcanaJSON schema; the strategy reads the
+`fullName` / `simpleName` fields for matching and the `images.full` URL
+(usually 1468 x 2048 px) for downloads.
 
 ```json
 {
   "cards": [
     {
-      "name": "Mickey Mouse - Steamboat Pilot",
-      "image_url": "https://example.com/images/mickey-steamboat.jpg"
+      "fullName": "Mickey Mouse - Steamboat Pilot",
+      "simpleName": "mickey mouse steamboat pilot",
+      "images": { "full": "https://.../mickey-steamboat.png" }
     }
   ]
 }
 ```
 
-When a card is not present in the local database, the Lorcana strategy falls
-back to scraping `https://lorcana.gg/cards/`.
+Force a refresh of the cached database with `--refresh-db`. When a card is
+not present in the LorcanaJSON database, the strategy falls back to scraping
+`https://lorcana.gg/cards/`.
 
 ---
 
