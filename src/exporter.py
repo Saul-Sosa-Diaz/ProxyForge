@@ -24,17 +24,16 @@ MM_PER_INCH = 25.4
 CARD_WIDTH_PX = round(CARD_WIDTH_MM * PRINT_DPI / MM_PER_INCH)   # 1989
 CARD_HEIGHT_PX = round(CARD_HEIGHT_MM * PRINT_DPI / MM_PER_INCH)  # 2797
 
-# Crop mark geometry (all in millimetres, converted to pixels at render time).
-CROP_MARK_LEN_MM = 3.0        # length of each crop-mark tick
-CROP_MARK_OFFSET_MM = 1.0     # gap between card edge and crop mark
-CROP_MARK_THICKNESS_MM = 0.25  # line thickness
+# Cut-line geometry (guillotine-friendly continuous lines at every card edge).
+CROP_MARK_OFFSET_MM = 0.0     # lines sit exactly on the card edge (cut where you see)
+CROP_MARK_THICKNESS_MM = 0.12  # thin line so any kerf drift leaves no visible sliver
 CROP_MARK_COLOR = (0, 0, 0)
 
 # Page geometry (A4 portrait by default).
 PAGE_WIDTH_MM = 210.0
 PAGE_HEIGHT_MM = 297.0
 PAGE_MARGIN_MM = 5.0
-CARD_GAP_MM = 3.0  # spacing between adjacent card slots (gutter for crop marks)
+CARD_GAP_MM = 0.0  # cards touch; one shared cut line separates two adjacent cards
 
 
 class Exporter:
@@ -158,7 +157,10 @@ class Exporter:
                 x = start_x + col * (card_w_px + gap_px)
                 y = start_y + row * (card_h_px + gap_px)
                 self._paste_card(page, slot_path, x, y, card_w_px, card_h_px)
-                self._draw_crop_marks(draw, x, y, card_w_px, card_h_px)
+            # Guillotine cut lines across the whole sheet, one per card edge.
+            self._draw_cut_lines(draw, start_x, start_y, cols, rows,
+                                 card_w_px, card_h_px, gap_px,
+                                 page_w_px, page_h_px)
             page_images.append(page)
 
         page_images[0].save(
@@ -206,41 +208,42 @@ class Exporter:
                 src = src.resize(target, Image.LANCZOS)
             page.paste(src, (x_px, y_px))
 
-    def _draw_crop_marks(
+    def _draw_cut_lines(
         self,
         draw: ImageDraw.ImageDraw,
-        x: int,
-        y: int,
-        w: int,
-        h: int,
+        start_x: int,
+        start_y: int,
+        cols: int,
+        rows: int,
+        card_w_px: int,
+        card_h_px: int,
+        gap_px: int,
+        page_w_px: int,
+        page_h_px: int,
     ) -> None:
-        """Draw four-corner crop marks around a 64x89 mm card slot.
+        """Draw continuous guillotine cut lines across the whole sheet.
 
-        Coordinates are integers so the marks land on the same pixel grid as
-        the pasted image (no sub-pixel drift between the two).
+        One vertical line per column boundary (cols + 1 lines) and one
+        horizontal line per row boundary (rows + 1 lines), each spanning the
+        full page so the blade can be aligned end-to-end in one straight cut.
+        Lines sit exactly on the card edges (offset 0): outer cuts trim the
+        block edge, inner cuts run along the shared edge of two touching
+        cards, so a single pass separates both cards with no white border on
+        either side (modulo the guillotine kerf).
         """
-        offset = round(self._mm_to_px(CROP_MARK_OFFSET_MM))
-        length = round(self._mm_to_px(CROP_MARK_LEN_MM))
         lw = max(1, round(self._mm_to_px(CROP_MARK_THICKNESS_MM)))
 
-        # Corner anchor points (just outside the card edges).
-        left = x - offset
-        right = x + w + offset
-        top = y - offset
-        bottom = y + h + offset
+        # Vertical cut lines: at the left edge of every column + the right
+        # edge of the last column.
+        for c in range(cols + 1):
+            x = start_x + c * (card_w_px + gap_px)
+            draw.line([(x, 0), (x, page_h_px)], fill=CROP_MARK_COLOR, width=lw)
 
-        # Top-left
-        draw.line([(left - length, top), (left, top)], fill=CROP_MARK_COLOR, width=lw)
-        draw.line([(left, top - length), (left, top)], fill=CROP_MARK_COLOR, width=lw)
-        # Top-right
-        draw.line([(right, top), (right + length, top)], fill=CROP_MARK_COLOR, width=lw)
-        draw.line([(right, top - length), (right, top)], fill=CROP_MARK_COLOR, width=lw)
-        # Bottom-left
-        draw.line([(left - length, bottom), (left, bottom)], fill=CROP_MARK_COLOR, width=lw)
-        draw.line([(left, bottom), (left, bottom + length)], fill=CROP_MARK_COLOR, width=lw)
-        # Bottom-right
-        draw.line([(right, bottom), (right + length, bottom)], fill=CROP_MARK_COLOR, width=lw)
-        draw.line([(right, bottom), (right, bottom + length)], fill=CROP_MARK_COLOR, width=lw)
+        # Horizontal cut lines: at the top edge of every row + the bottom
+        # edge of the last row.
+        for r in range(rows + 1):
+            y = start_y + r * (card_h_px + gap_px)
+            draw.line([(0, y), (page_w_px, y)], fill=CROP_MARK_COLOR, width=lw)
 
 
 # ----------------------------------------------------------------------
