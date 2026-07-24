@@ -32,7 +32,6 @@ alongside a print-ready PDF configured to exact physical card dimensions
 - [Output](#-output)
 - [LorcanaJSON Database & Cache](#-lorcanajson-database--cache-lorcana)
 - [Print Dimensions](#-print-dimensions)
-- [Roadmap](#-roadmap)
 - [Contributing](#-contributing)
 - [License](#-license)
 
