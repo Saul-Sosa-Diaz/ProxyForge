@@ -1,0 +1,15 @@
+services:
+  tcg-downloader:
+    build: .
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./data:/app/data
+    command:
+      [
+        "src/main.py",
+        "--input",
+        "/app/input/my_awesome_deck.txt",
+        "--tcg",
+        "lorcana"
+      ]
