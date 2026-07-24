@@ -26,15 +26,15 @@ CARD_HEIGHT_PX = round(CARD_HEIGHT_MM * PRINT_DPI / MM_PER_INCH)  # 2797
 
 # Crop mark geometry (all in millimetres, converted to pixels at render time).
 CROP_MARK_LEN_MM = 3.0        # length of each crop-mark tick
-CROP_MARK_OFFSET_MM = 2.0     # gap between card edge and crop mark
+CROP_MARK_OFFSET_MM = 1.0     # gap between card edge and crop mark
 CROP_MARK_THICKNESS_MM = 0.25  # line thickness
 CROP_MARK_COLOR = (0, 0, 0)
 
 # Page geometry (A4 portrait by default).
 PAGE_WIDTH_MM = 210.0
 PAGE_HEIGHT_MM = 297.0
-PAGE_MARGIN_MM = 10.0
-CARD_GAP_MM = 0.0  # spacing between adjacent card slots (room for crop marks)
+PAGE_MARGIN_MM = 5.0
+CARD_GAP_MM = 3.0  # spacing between adjacent card slots (gutter for crop marks)
 
 
 class Exporter:
@@ -138,8 +138,14 @@ class Exporter:
         page_h_px = round(self._mm_to_px(self.page_height_mm))
         card_w_px = round(self._mm_to_px(CARD_WIDTH_MM))
         card_h_px = round(self._mm_to_px(CARD_HEIGHT_MM))
-        gap_px = self._mm_to_px(self.card_gap_mm)
-        margin_px = self._mm_to_px(self.page_margin_mm)
+        gap_px = round(self._mm_to_px(self.card_gap_mm))
+
+        # Center the grid block on the page so outer crop marks always sit
+        # inside the sheet (never clipped at the page edge).
+        block_w_px = cols * card_w_px + (cols - 1) * gap_px
+        block_h_px = rows * card_h_px + (rows - 1) * gap_px
+        start_x = round((page_w_px - block_w_px) / 2)
+        start_y = round((page_h_px - block_h_px) / 2)
 
         page_images: list[Image.Image] = []
         for page_start in range(0, len(valid_slots), per_page):
@@ -149,8 +155,8 @@ class Exporter:
             for idx, slot_path in enumerate(page_slots):
                 col = idx % cols
                 row = idx // cols
-                x = margin_px + col * (card_w_px + gap_px)
-                y = margin_px + row * (card_h_px + gap_px)
+                x = start_x + col * (card_w_px + gap_px)
+                y = start_y + row * (card_h_px + gap_px)
                 self._paste_card(page, slot_path, x, y, card_w_px, card_h_px)
                 self._draw_crop_marks(draw, x, y, card_w_px, card_h_px)
             page_images.append(page)
@@ -173,18 +179,23 @@ class Exporter:
         return slots
 
     def _compute_grid(self) -> tuple[int, int]:
+        # Each row needs cols*card + (cols-1)*gap. Rearranged so the trailing
+        # gap is NOT counted (it doesn't exist after the last card), which is
+        # what makes a 3x3 grid fit on A4 with the configured gap.
         usable_w = self.page_width_mm - 2 * self.page_margin_mm
         usable_h = self.page_height_mm - 2 * self.page_margin_mm
-        cols = max(1, int(usable_w // (CARD_WIDTH_MM + self.card_gap_mm)))
-        rows = max(1, int(usable_h // (CARD_HEIGHT_MM + self.card_gap_mm)))
+        cell_w = CARD_WIDTH_MM + self.card_gap_mm
+        cell_h = CARD_HEIGHT_MM + self.card_gap_mm
+        cols = max(1, int((usable_w + self.card_gap_mm) // cell_w))
+        rows = max(1, int((usable_h + self.card_gap_mm) // cell_h))
         return cols, rows
 
     def _paste_card(
         self,
         page: Image.Image,
         slot_path: Path,
-        x_px: float,
-        y_px: float,
+        x_px: int,
+        y_px: int,
         card_w_px: int,
         card_h_px: int,
     ) -> None:
@@ -193,19 +204,23 @@ class Exporter:
             target = (card_w_px, card_h_px)
             if src.size != target:
                 src = src.resize(target, Image.LANCZOS)
-            page.paste(src, (round(x_px), round(y_px)))
+            page.paste(src, (x_px, y_px))
 
     def _draw_crop_marks(
         self,
         draw: ImageDraw.ImageDraw,
-        x: float,
-        y: float,
-        w: float,
-        h: float,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
     ) -> None:
-        """Draw four-corner crop marks around a 64x89 mm card slot."""
-        offset = self._mm_to_px(CROP_MARK_OFFSET_MM)
-        length = self._mm_to_px(CROP_MARK_LEN_MM)
+        """Draw four-corner crop marks around a 64x89 mm card slot.
+
+        Coordinates are integers so the marks land on the same pixel grid as
+        the pasted image (no sub-pixel drift between the two).
+        """
+        offset = round(self._mm_to_px(CROP_MARK_OFFSET_MM))
+        length = round(self._mm_to_px(CROP_MARK_LEN_MM))
         lw = max(1, round(self._mm_to_px(CROP_MARK_THICKNESS_MM)))
 
         # Corner anchor points (just outside the card edges).

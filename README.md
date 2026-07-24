@@ -167,9 +167,11 @@ not present in the LorcanaJSON database, the strategy falls back to scraping
 | Property | Value |
 | --- | --- |
 | Card size | 64 x 89 mm |
-| Print DPI | 300 |
-| Card pixels (at 300 DPI) | ~756 x 1051 px |
+| Print DPI | 800 |
+| Card pixels (at 800 DPI) | ~2016 x 2800 px |
 | Page size | A4 (210 x 297 mm) |
-| Margins | 10 mm |
+| Grid | 3 x 3 (9 cards per page) |
+| Margins | 5 mm (block centered) |
+| Card gap (gutter for crop marks) | 3 mm |
 | Crop mark length | 3 mm |
-| Crop mark offset from card | 2 mm |
+| Crop mark offset from card | 1 mm |

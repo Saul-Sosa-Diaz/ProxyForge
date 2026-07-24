@@ -1,15 +1,11 @@
 services:
   tcg-downloader:
     build: .
+    container_name: tcg-downloader
+    tty: true
+    stdin_open: true
     volumes:
       - ./input:/app/input
       - ./output:/app/output
       - ./data:/app/data
-    command:
-      [
-        "src/main.py",
-        "--input",
-        "/app/input/my_awesome_deck.txt",
-        "--tcg",
-        "lorcana"
-      ]
+      - ./src:/app/src
