@@ -21,6 +21,7 @@ from src.parser import parse_deck_file
 from src.strategies.base import TCGStrategy
 from src.strategies.lorcana import LorcanaStrategy
 from src.strategies.mtg import MTGStrategy
+from src.strategies.pokemon import PokemonStrategy
 
 logger = logging.getLogger("tcg-downloader")
 
@@ -50,7 +51,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--tcg",
         "-t",
         required=True,
-        choices=["lorcana", "mtg"],
+        choices=["lorcana", "mtg", "pokemon"],
         help="TCG strategy to apply for image fetching.",
     )
     parser.add_argument(
@@ -75,6 +76,7 @@ def _build_parser() -> argparse.ArgumentParser:
 _STRATEGY_REGISTRY: dict[str, type[TCGStrategy]] = {
     "lorcana": LorcanaStrategy,
     "mtg": MTGStrategy,
+    "pokemon": PokemonStrategy,
 }
 
 
@@ -115,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", exc)
         return 2
 
-    exporter = Exporter(strategy=strategy, output_base_dir=args.output)
+    exporter = Exporter(strategy=strategy, output_base_dir=args.output + f"/{args.tcg}")
     try:
         pdf_path = exporter.export_deck(deck_name, cards)
     except Exception as exc:  # noqa: BLE001 - top-level CLI guard

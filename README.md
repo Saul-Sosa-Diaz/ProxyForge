@@ -31,6 +31,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 - [CLI Arguments](#-cli-arguments)
 - [Output](#-output)
 - [LorcanaJSON Database & Cache](#-lorcanajson-database--cache-lorcana)
+- [PkmnCards Naming](#-pkmncards-naming-pokémon)
 - [Print Dimensions](#-print-dimensions)
 - [Contributing](#-contributing)
 - [License](#-license)
@@ -44,6 +45,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 📝 **Standard parsing** | Reads decklists in `<quantity> <full card name>` format |
 | 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
 | 🃏 **Lorcana** | Queries the **LorcanaJSON** API, caches locally, and falls back to scraping `lorcana.gg` |
+| ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
 | 🔮 **Magic: The Gathering** | Stub ready for Scryfall API integration |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
@@ -122,7 +124,7 @@ python src/main.py --input input/my_awesome_deck.txt --output output --tcg lorca
 | --- | --- | --- | --- |
 | `--input` | `-i` | _required_ | Path to the standard `.txt` deck file. |
 | `--output` | `-o` | `/app/output` | Base output directory. |
-| `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `mtg`). |
+| `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`). |
 | `--db-cache` | | `data/lorcana_cache.json` | Path to the LorcanaJSON cache file (Lorcana only). Auto-created on first run. |
 | `--refresh-db` | | off | Force re-download of the LorcanaJSON database, ignoring the cache. |
 | `--verbose` | `-v` | off | Enable verbose logging. |
@@ -171,6 +173,34 @@ Each card in the cache follows the LorcanaJSON schema; the strategy reads the
 Force a refresh of the cached database with `--refresh-db`. When a card is
 not present in the LorcanaJSON database, the strategy falls back to scraping
 `https://lorcana.gg/cards/`.
+
+---
+
+## ⚡ PkmnCards Naming (Pokémon)
+
+The Pokémon strategy fetches images from **[pkmncards.com](https://pkmncards.com)**,
+so card names in the decklist should match the ones used on that site.
+
+Pokémon reprints the same character in many different sets (there are dozens
+of Pikachus), so the strategy always queries the **site search**
+(`https://pkmncards.com/?s=<card name>`) instead of guessing a card URL. Each
+search result carries its full title — `Name · Set (CODE) #number`, e.g.
+`Pikachu ex · Ascended Heroes (ASC) #276` — and the strategy picks the best
+match:
+
+1. Exact title match (punctuation like `·`, `#` or parentheses is ignored).
+2. Title starting with the given name (e.g. `Pikachu ex Ascended Heroes`).
+3. Otherwise, the **first search hit** is used and a warning is logged.
+
+> ⚠️ To get the exact printing you want, include the set name (and ideally
+> the set code and collector number) as written on pkmncards.com:
+>
+> ```text
+> 4 Pikachu ex · Ascended Heroes (ASC) #276
+> 4 Boss's Orders · Paldea Evolved (PAL) #172
+> ```
+>
+> A bare `4 Pikachu` will resolve to an arbitrary printing.
 
 ---
 
