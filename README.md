@@ -32,6 +32,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 - [Output](#-output)
 - [LorcanaJSON Database & Cache](#-lorcanajson-database--cache-lorcana)
 - [PkmnCards Naming](#-pkmncards-naming-pokémon)
+- [Local Images](#-local-images-local)
 - [Print Dimensions](#-print-dimensions)
 - [Contributing](#-contributing)
 - [License](#-license)
@@ -47,6 +48,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 🃏 **Lorcana** | Queries the **LorcanaJSON** API, caches locally, and falls back to scraping `lorcana.gg` |
 | ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
 | 🔮 **Magic: The Gathering** | Stub ready for Scryfall API integration |
+| 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
 | 🖨️ **Print-ready PDF** | Multi-page A4 grid at **800 DPI** with crop marks around every 64 x 89 mm card slot |
@@ -124,8 +126,9 @@ python src/main.py --input input/my_awesome_deck.txt --output output --tcg lorca
 | --- | --- | --- | --- |
 | `--input` | `-i` | _required_ | Path to the standard `.txt` deck file. |
 | `--output` | `-o` | `/app/output` | Base output directory. |
-| `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`). |
+| `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`, `local`). |
 | `--db-cache` | | `data/lorcana_cache.json` | Path to the LorcanaJSON cache file (Lorcana only). Auto-created on first run. |
+| `--local-dir` | | `input/images` | Directory with local card images (Local only). Card names in the decklist must match the local file names. |
 | `--refresh-db` | | off | Force re-download of the LorcanaJSON database, ignoring the cache. |
 | `--verbose` | `-v` | off | Enable verbose logging. |
 
@@ -201,6 +204,38 @@ match:
 > ```
 >
 > A bare `4 Pikachu` will resolve to an arbitrary printing.
+
+---
+
+## 💾 Local Images (Local)
+
+The `local` strategy skips every remote source and resolves cards from a
+directory on disk (`--local-dir`, default `input/images`). **The card name in
+the decklist is the local file name** (extension optional):
+
+```text
+4 Mickey_Mouse_-_Steamboat_Pilot
+2 Brawl.png
+```
+
+```text
+input/images/
+├── Mickey_Mouse_-_Steamboat_Pilot.png   # matches "Mickey_Mouse_-_Steamboat_Pilot"
+└── Brawl.png                            # matches "Brawl" or "Brawl.png"
+```
+
+Resolution order:
+
+1. Exact file name match (`.png`, `.jpg`, `.jpeg` and `.webp` supported).
+2. Case-insensitive match by file name or stem.
+
+```bash
+python src/main.py --input input/my_deck.txt --output output --tcg local \
+  --local-dir input/images
+```
+
+> 💡 This is the fastest way to re-print a previously downloaded deck: point
+> `--local-dir` at an existing `output/<tcg>/<deck>/images` folder.
 
 ---
 
