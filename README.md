@@ -47,7 +47,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
 | 🃏 **Lorcana** | Queries the **LorcanaJSON** API, caches locally, and falls back to scraping `lorcana.gg` |
 | ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
-| 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) (exact + fuzzy name lookup, high-res `png` imagery) with a local cache and search fallback |
+| 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) (exact + fuzzy name lookup, high-res `png` imagery) with a local cache, search fallback, and a final [Moxfield](https://moxfield.com) fallback |
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
@@ -190,6 +190,12 @@ The MTG strategy resolves each card through the **Scryfall API**
    `set=2x2`.
 2. `GET /cards/search` — last-resort search for names the named lookup
    cannot resolve.
+3. [Moxfield](https://moxfield.com) — final fallback when Scryfall cannot
+   resolve the card at all. The card is looked up via Moxfield's search API
+   (the JSON backend of `moxfield.com/cards/search`) and the image is taken
+   from their assets CDN (`assets.moxfield.net/cards/card-<id>-normal.jpg`),
+   the same URL served by the "Download Image" button on
+   `moxfield.com/cards/<id>-<name>` pages.
 
 Images are downloaded from the Scryfall image CDN in the highest-quality
 `png` version (744 x 1040, transparent rounded corners); the remaining

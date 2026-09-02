@@ -1,15 +1,23 @@
 """MTG image-fetching strategy.
 
-Resolution order (both sources live on the Scryfall API,
-https://scryfall.com/docs/api):
-    1. Card name lookup (``GET /cards/named``). The decklist name is tried
-       with an exact match first and a fuzzy match second; set annotations
-       from the decklist (``Lightning Bolt (2x2) 117``, ``Counterspell
-       [MH2]``) are parsed and forwarded as the ``set`` parameter. Resolved
-       names are cached locally (name -> image URL) to avoid repeated API
-       calls on subsequent runs, as recommended by Scryfall's guidelines.
-    2. Card search fallback (``GET /cards/search?q=<name>``) for names the
-       named-lookup endpoint cannot resolve (typos, extra tokens...).
+Resolution order (Scryfall API, https://scryfall.com/docs/api, then
+Moxfield, https://moxfield.com):
+    1. Scryfall card name lookup (``GET /cards/named``). The decklist name
+       is tried with an exact match first and a fuzzy match second; set
+       annotations from the decklist (``Lightning Bolt (2x2) 117``,
+       ``Counterspell [MH2]``) are parsed and forwarded as the ``set``
+       parameter. Resolved names are cached locally (name -> image URL) to
+       avoid repeated API calls on subsequent runs, as recommended by
+       Scryfall's guidelines.
+    2. Scryfall card search fallback (``GET /cards/search?q=<name>``) for
+       names the named-lookup endpoint cannot resolve (typos, extra
+       tokens...).
+    3. Moxfield fallback (``GET https://api.moxfield.com/v2/cards/search``)
+       when Scryfall cannot resolve the card at all. The matched card's
+       internal Moxfield id feeds the assets CDN image that the
+       "Download Image" button on ``https://moxfield.com/cards/<id>-<slug>``
+       pages points to
+       (``https://assets.moxfield.net/cards/card-<id>-normal.jpg``).
 
 Images are served by the Scryfall image CDN (``cards.scryfall.io``) in the
 versions documented at https://scryfall.com/docs/api/images. By default the
@@ -18,8 +26,8 @@ versions documented at https://scryfall.com/docs/api/images. By default the
 
 Rate limits (https://scryfall.com/docs/api/rate-limits): the ``/cards/*``
 endpoints are limited to 2 requests/second, so a minimum interval is
-enforced between API calls and HTTP 429 responses are honored via the
-``Retry-After`` header. The image CDN has no rate limits.
+enforced between Scryfall API calls and HTTP 429 responses are honored via
+the ``Retry-After`` header. The image CDNs have no rate limits.
 """
 from __future__ import annotations
 
@@ -45,6 +53,8 @@ class MTGStrategy(TCGStrategy):
     SCRYFALL_API_URL = "https://api.scryfall.com"
     NAMED_ENDPOINT = "/cards/named"
     SEARCH_ENDPOINT = "/cards/search"
+    MOXFIELD_SEARCH_API_URL = "https://api.moxfield.com/v2/cards/search"
+    MOXFIELD_ASSETS_URL = "https://assets.moxfield.net/cards"
     DEFAULT_TIMEOUT = 30
     # Scryfall limits /cards/* to 2 requests/second (500 ms between calls).
     DEFAULT_MIN_REQUEST_INTERVAL = 0.5
@@ -104,6 +114,11 @@ class MTGStrategy(TCGStrategy):
                 card_name,
             )
             url = self._lookup_scryfall_search(clean_name)
+        if not url:
+            logger.debug(
+                "Card '%s' not found on Scryfall; falling back to Moxfield", card_name
+            )
+            url = self._lookup_moxfield(card_name)
         if url:
             self._store_cache(card_name, url)
         return url
@@ -191,6 +206,108 @@ class MTGStrategy(TCGStrategy):
         if not isinstance(data, list) or not data or not isinstance(data[0], dict):
             return None
         return self._extract_image_url(data[0])
+
+    # ------------------------------------------------------------------
+    # Source 3: Moxfield fallback
+    # ------------------------------------------------------------------
+    def _lookup_moxfield(self, card_name: str) -> str | None:
+        """Resolve a card via Moxfield when Scryfall fails.
+
+        Moxfield's card search API (the JSON backend of
+        ``https://moxfield.com/cards/search``) returns each match with its
+        internal Moxfield ``id``, which is both the slug of the card page
+        (``/cards/<id>-<name>``) and the key of its CDN images
+        (``assets.moxfield.net/cards/card-<id>-normal.jpg``, the URL behind
+        the page's "Download Image" button).
+        """
+        clean_name, set_code = _parse_card_reference(card_name)
+        results = self._moxfield_search(clean_name)
+        if not results:
+            return None
+        card = self._select_moxfield_result(results, clean_name, set_code)
+        if card is None:
+            return None
+        logger.debug(
+            "Card '%s' matched '%s' (%s #%s) on Moxfield",
+            card_name,
+            card.get("name"),
+            card.get("set_name"),
+            card.get("cn"),
+        )
+        return self._moxfield_image_url(card.get("id"))
+
+    def _moxfield_search(self, card_name: str) -> list[dict[str, Any]]:
+        try:
+            resp = self._session.get(
+                self.MOXFIELD_SEARCH_API_URL, params={"q": card_name}, timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            logger.warning("Moxfield search request failed: %s", exc)
+            return []
+        if resp.status_code != 200:
+            logger.debug("Moxfield search returned HTTP %s", resp.status_code)
+            return []
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            return []
+        results = data.get("data")
+        if not isinstance(results, list):
+            return []
+        return [r for r in results if isinstance(r, dict)]
+
+    @staticmethod
+    def _select_moxfield_result(
+        results: list[dict[str, Any]],
+        card_name: str,
+        set_code: str | None,
+    ) -> dict[str, Any] | None:
+        """Pick the Moxfield search result that best matches ``card_name``.
+
+        Exact (normalized) name matches win, preferring the printing whose
+        set code matches the decklist annotation. Without an exact match the
+        first hit is used, with a warning when several candidates exist.
+        """
+        key = _normalize(card_name)
+        exact = [r for r in results if _normalize(str(r.get("name", ""))) == key]
+        if exact:
+            if set_code:
+                for r in exact:
+                    if str(r.get("set", "")).lower() == set_code:
+                        return r
+            return exact[0]
+        if len(results) > 1:
+            logger.warning(
+                "Card '%s' is ambiguous on Moxfield (%d hits, e.g. '%s', '%s'); "
+                "using the first hit '%s'. Add the set code to disambiguate.",
+                card_name,
+                len(results),
+                results[0].get("name"),
+                results[1].get("name"),
+                results[0].get("name"),
+            )
+        return results[0]
+
+    def _moxfield_image_url(self, card_id: Any) -> str | None:
+        """Build the Moxfield CDN image URL for a card id.
+
+        ``normal`` is the full-card image used by the "Download Image"
+        button; ``art_crop`` is the artwork-only fallback.
+        """
+        if not isinstance(card_id, str) or not card_id:
+            return None
+        for variant in ("normal", "art_crop"):
+            url = f"{self.MOXFIELD_ASSETS_URL}/card-{card_id}-{variant}.jpg"
+            if self._asset_exists(url):
+                return url
+        return None
+
+    def _asset_exists(self, url: str) -> bool:
+        try:
+            resp = self._session.head(url, timeout=self.timeout, allow_redirects=True)
+        except requests.RequestException:
+            return False
+        return resp.status_code == 200
 
     # ------------------------------------------------------------------
     # Card object -> image URL
