@@ -2,5 +2,6 @@
 .venv
 **__pycache__/
 /data/lorcana_cache.json
+/data/mtg_cache.json
 /output/
 /input/

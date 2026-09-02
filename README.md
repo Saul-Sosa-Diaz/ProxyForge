@@ -47,7 +47,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
 | 🃏 **Lorcana** | Queries the **LorcanaJSON** API, caches locally, and falls back to scraping `lorcana.gg` |
 | ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
-| 🔮 **Magic: The Gathering** | Stub ready for Scryfall API integration |
+| 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) (exact + fuzzy name lookup, high-res `png` imagery) with a local cache and search fallback |
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
@@ -127,9 +127,9 @@ python src/main.py --input input/my_awesome_deck.txt --output output --tcg lorca
 | `--input` | `-i` | _required_ | Path to the standard `.txt` deck file. |
 | `--output` | `-o` | `/app/output` | Base output directory. |
 | `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`, `local`). |
-| `--db-cache` | | `data/lorcana_cache.json` | Path to the LorcanaJSON cache file (Lorcana only). Auto-created on first run. |
+| `--db-cache` | | per strategy | Path to the strategy cache file (Lorcana/MTG). Auto-created on first run. Defaults: `data/lorcana_cache.json`, `data/mtg_cache.json`. |
 | `--local-dir` | | `input/images` | Directory with local card images (Local only). Card names in the decklist must match the local file names. |
-| `--refresh-db` | | off | Force re-download of the LorcanaJSON database, ignoring the cache. |
+| `--refresh-db` | | off | Force re-resolution of cards, ignoring the local cache (Lorcana/MTG). |
 | `--verbose` | `-v` | off | Enable verbose logging. |
 
 ---
@@ -176,6 +176,32 @@ Each card in the cache follows the LorcanaJSON schema; the strategy reads the
 Force a refresh of the cached database with `--refresh-db`. When a card is
 not present in the LorcanaJSON database, the strategy falls back to scraping
 `https://lorcana.gg/cards/`.
+
+---
+
+## 🔮 Scryfall Lookup & Cache (Magic: The Gathering)
+
+The MTG strategy resolves each card through the **Scryfall API**
+(`https://api.scryfall.com`):
+
+1. `GET /cards/named` — exact match first, fuzzy match second, so typos and
+   accent variations still resolve. Decklist set annotations are understood
+   and forwarded: `Lightning Bolt (2x2) 117` → `exact=Lightning Bolt` +
+   `set=2x2`.
+2. `GET /cards/search` — last-resort search for names the named lookup
+   cannot resolve.
+
+Images are downloaded from the Scryfall image CDN in the highest-quality
+`png` version (744 x 1040, transparent rounded corners); the remaining
+versions (`large`, `normal`, `border_crop`, `small`) act as fallbacks.
+Double-faced cards use the front face (`card_faces[0].image_uris`).
+
+Resolved names are cached in `data/mtg_cache.json` (override with
+`--db-cache`, force re-resolution with `--refresh-db`) so subsequent runs
+skip the API entirely, following Scryfall's caching guidelines. Scryfall's
+rate limits are honored: a 500 ms minimum interval between API requests and
+`Retry-After` handling on HTTP 429 (see
+[Rate Limits](https://scryfall.com/docs/api/rate-limits)).
 
 ---
 

@@ -65,13 +65,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db-cache",
-        default="data/lorcana_cache.json",
-        help="Path to the LorcanaJSON cache file (Lorcana only). Auto-created on first run.",
+        default=None,
+        help=(
+            "Path to the strategy cache file (Lorcana/MTG). Auto-created on first run. "
+            "Defaults: data/lorcana_cache.json (Lorcana), data/mtg_cache.json (MTG)."
+        ),
     )
     parser.add_argument(
         "--refresh-db",
         action="store_true",
-        help="Force re-download of the LorcanaJSON database, ignoring the local cache.",
+        help="Force re-resolution of cards, ignoring the local cache (Lorcana/MTG).",
     )
     parser.add_argument(
         "--verbose",
@@ -101,6 +104,11 @@ def _make_strategy(
         raise ValueError(f"Unknown TCG strategy: {name}")
     if cls is LorcanaStrategy:
         return LorcanaStrategy(
+            cache_path=db_cache,
+            refresh_db=refresh_db,
+        )
+    if cls is MTGStrategy:
+        return MTGStrategy(
             cache_path=db_cache,
             refresh_db=refresh_db,
         )
