@@ -3,7 +3,7 @@
 4 Lilo - Escape Artist
 4 Tramp - Enterprising Dog
 4 Tramp - Street-Smart Dog
-4 Lady - Decisive Dog
+4 Lady - Decisive Dog *F*
 4 Bobby Zimuruski - Spray Cheese Kid
 2 Under the Sea
 4 Mowgli - Man Cub
