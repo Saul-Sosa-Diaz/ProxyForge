@@ -5,3 +5,4 @@
 /data/mtg_cache.json
 /output/
 /input/
+!input\my_awesome_deck.txt
