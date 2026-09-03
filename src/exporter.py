@@ -1,4 +1,5 @@
 """Output generation: image download, de-duplication and print-ready PDF."""
+
 from __future__ import annotations
 
 import logging
@@ -13,19 +14,27 @@ from .strategies.base import TCGStrategy
 logger = logging.getLogger(__name__)
 
 # Physical card dimensions in millimetres (target print size).
-CARD_WIDTH_MM = 64.0
-CARD_HEIGHT_MM = 89.0
+# Standard TCG card size (63x88 mm); must never change so cards fit sleeves.
+CARD_WIDTH_MM = 63.0
+CARD_HEIGHT_MM = 88.0
 
 # Print resolution.
 PRINT_DPI = 800
 MM_PER_INCH = 25.4
 
-# Card pixel size at the default 800 DPI (64x89 mm -> ~1989x2797 px).
-CARD_WIDTH_PX = round(CARD_WIDTH_MM * PRINT_DPI / MM_PER_INCH)   # 1989
-CARD_HEIGHT_PX = round(CARD_HEIGHT_MM * PRINT_DPI / MM_PER_INCH)  # 2797
+# Card pixel size at the default 800 DPI (63x88 mm -> ~1984x2772 px).
+CARD_WIDTH_PX = round(CARD_WIDTH_MM * PRINT_DPI / MM_PER_INCH)  # 1984
+CARD_HEIGHT_PX = round(CARD_HEIGHT_MM * PRINT_DPI / MM_PER_INCH)  # 2772
 
-# Cut-line geometry (guillotine-friendly continuous lines at every card edge).
-CROP_MARK_OFFSET_MM = 0.0     # lines sit exactly on the card edge (cut where you see)
+# Professional cut geometry: gutter between cards, optional bleed and
+# trim (crop) marks placed in the outer margins of the sheet.
+# Bleed is DISABLED (0.0): any artwork drawn past the trim line moves the
+# visible card edge beyond the 63x88 mm boundary, so the crop marks appear
+# misaligned with the card and the card looks enlarged. With no bleed the
+# marks coincide exactly with the visible card edges and the full 3 mm
+# gutter stays white.
+BLEED_MM = 0.0  # mirrored-edge overrun past the card edge (0 = disabled)
+CROP_MARK_LENGTH_MM = 3.0  # tick length, pointing outward from the block
 CROP_MARK_THICKNESS_MM = 0.12  # thin line so any kerf drift leaves no visible sliver
 CROP_MARK_COLOR = (0, 0, 0)
 
@@ -33,17 +42,26 @@ CROP_MARK_COLOR = (0, 0, 0)
 PAGE_WIDTH_MM = 210.0
 PAGE_HEIGHT_MM = 297.0
 PAGE_MARGIN_MM = 5.0
-CARD_GAP_MM = 0.0  # cards touch; one shared cut line separates two adjacent cards
+# Gutter (separation) between adjacent cards: 3 mm of clean white paper.
+CARD_GAP_MM = 3.0
 
 
 class Exporter:
     """Download unique card images and assemble a print-ready PDF grid.
 
     The PDF is rendered as a high-resolution raster at ``target_dpi`` so that
-    each 64x89 mm card slot measures exactly ``CARD_WIDTH_PX x CARD_HEIGHT_PX``
-    pixels (e.g. 1989x2797 px at 800 DPI). When Pillow saves the page with
+    each 63x88 mm card slot measures exactly ``CARD_WIDTH_PX x CARD_HEIGHT_PX``
+    pixels (e.g. 1984x2772 px at 800 DPI). When Pillow saves the page with
     ``resolution=target_dpi`` the resulting MediaBox is the true physical page
-    size (A4 = 595x842 pt), so every card prints at exactly 64x89 mm.
+    size (A4 = 595x842 pt), so every card prints at exactly 63x88 mm.
+
+    Professional sheet layout: cards are separated by a ``card_gap_mm``
+    gutter and rendered at exactly 63x88 mm (never rescaled beyond that
+    size). Crop marks in the outer page margins point exactly at the visible
+    card edges, so a cut aligned with a mark trims the card to precisely
+    63x88 mm. An optional mirrored-edge bleed (``BLEED_MM`` > 0) can extend
+    the artwork into the gutter, but it is disabled by default because it
+    shifts the visible edge past the trim line.
     """
 
     def __init__(
@@ -100,7 +118,9 @@ class Exporter:
             logger.info("Foil PDF written to %s", foil_pdf_path)
             pdf_path = pdf_path or foil_pdf_path
         else:
-            logger.debug("Deck '%s' has no foil cards; no foil PDF generated.", deck_name)
+            logger.debug(
+                "Deck '%s' has no foil cards; no foil PDF generated.", deck_name
+            )
         assert pdf_path is not None
         return pdf_path
 
@@ -163,6 +183,11 @@ class Exporter:
         card_w_px = round(self._mm_to_px(CARD_WIDTH_MM))
         card_h_px = round(self._mm_to_px(CARD_HEIGHT_MM))
         gap_px = round(self._mm_to_px(self.card_gap_mm))
+        # Bleed must never overrun the gutter (a white strip has to remain
+        # between adjacent cards) nor the page margin (outer bleed stays on
+        # the sheet).
+        bleed_mm = min(BLEED_MM, self.card_gap_mm / 2.0, self.page_margin_mm)
+        bleed_px = round(self._mm_to_px(bleed_mm))
 
         # Center the grid block on the page so outer crop marks always sit
         # inside the sheet (never clipped at the page edge).
@@ -181,11 +206,19 @@ class Exporter:
                 row = idx // cols
                 x = start_x + col * (card_w_px + gap_px)
                 y = start_y + row * (card_h_px + gap_px)
-                self._paste_card(page, slot_path, x, y, card_w_px, card_h_px)
-            # Guillotine cut lines across the whole sheet, one per card edge.
-            self._draw_cut_lines(draw, start_x, start_y, cols, rows,
-                                 card_w_px, card_h_px, gap_px,
-                                 page_w_px, page_h_px)
+                self._paste_card(page, slot_path, x, y, card_w_px, card_h_px, bleed_px)
+            # Trim (crop) marks in the outer margins, one tick per card edge.
+            self._draw_crop_marks(
+                draw,
+                start_x,
+                start_y,
+                cols,
+                rows,
+                card_w_px,
+                card_h_px,
+                gap_px,
+                bleed_px,
+            )
             page_images.append(page)
 
         page_images[0].save(
@@ -225,15 +258,56 @@ class Exporter:
         y_px: int,
         card_w_px: int,
         card_h_px: int,
+        bleed_px: int,
     ) -> None:
+        """Paste a card at its exact nominal size with mirrored-edge bleed.
+
+        The card artwork itself is rendered at exactly ``card_w_px x
+        card_h_px`` (63x88 mm, never enlarged). The bleed strip that extends
+        ``bleed_px`` into the gutter is a mirrored copy of the artwork's
+        outer edge, so the trim line (where the crop marks point) coincides
+        exactly with the visible card edge.
+        """
         with Image.open(slot_path) as src:
             src = src.convert("RGB")
-            target = (card_w_px, card_h_px)
-            if src.size != target:
-                src = src.resize(target, Image.LANCZOS)
-            page.paste(src, (x_px, y_px))
+            if src.size != (card_w_px, card_h_px):
+                src = src.resize((card_w_px, card_h_px), Image.LANCZOS)
+            if bleed_px <= 0:
+                page.paste(src, (x_px, y_px))
+                return
 
-    def _draw_cut_lines(
+            b = bleed_px
+            w, h = card_w_px, card_h_px
+            canvas = Image.new("RGB", (w + 2 * b, h + 2 * b))
+            canvas.paste(src, (b, b))
+            # Edge strips mirrored into the gutter (left, right, top, bottom).
+            canvas.paste(
+                src.crop((0, 0, b, h)).transpose(Image.FLIP_LEFT_RIGHT), (0, b)
+            )
+            canvas.paste(
+                src.crop((w - b, 0, w, h)).transpose(Image.FLIP_LEFT_RIGHT), (b + w, b)
+            )
+            canvas.paste(
+                src.crop((0, 0, w, b)).transpose(Image.FLIP_TOP_BOTTOM), (b, 0)
+            )
+            canvas.paste(
+                src.crop((0, h - b, w, h)).transpose(Image.FLIP_TOP_BOTTOM), (b, b + h)
+            )
+            # Corner squares mirrored diagonally.
+            canvas.paste(src.crop((0, 0, b, b)).transpose(Image.ROTATE_180), (0, 0))
+            canvas.paste(
+                src.crop((w - b, 0, w, b)).transpose(Image.ROTATE_180), (b + w, 0)
+            )
+            canvas.paste(
+                src.crop((0, h - b, b, h)).transpose(Image.ROTATE_180), (0, b + h)
+            )
+            canvas.paste(
+                src.crop((w - b, h - b, w, h)).transpose(Image.ROTATE_180),
+                (b + w, b + h),
+            )
+            page.paste(canvas, (x_px - b, y_px - b))
+
+    def _draw_crop_marks(
         self,
         draw: ImageDraw.ImageDraw,
         start_x: int,
@@ -243,32 +317,64 @@ class Exporter:
         card_w_px: int,
         card_h_px: int,
         gap_px: int,
-        page_w_px: int,
-        page_h_px: int,
+        bleed_px: int,
     ) -> None:
-        """Draw continuous guillotine cut lines across the whole sheet.
+        """Draw trim (crop) marks in the outer margins of the sheet.
 
-        One vertical line per column boundary (cols + 1 lines) and one
-        horizontal line per row boundary (rows + 1 lines), each spanning the
-        full page so the blade can be aligned end-to-end in one straight cut.
-        Lines sit exactly on the card edges (offset 0): outer cuts trim the
-        block edge, inner cuts run along the shared edge of two touching
-        cards, so a single pass separates both cards with no white border on
-        either side (modulo the guillotine kerf).
+        Every card edge is projected into the top/bottom (vertical cuts) and
+        left/right (horizontal cuts) margins as a short tick pointing
+        exactly at the card edge, so a guillotine cut aligned with a tick
+        trims the card to precisely 63x88 mm. At the block corners the
+        perpendicular ticks form a cut cross for the corner card.
         """
         lw = max(1, round(self._mm_to_px(CROP_MARK_THICKNESS_MM)))
+        mark_len = round(self._mm_to_px(CROP_MARK_LENGTH_MM))
+        off = bleed_px  # keep the clean margin free of artwork and marks overlap
 
-        # Vertical cut lines: at the left edge of every column + the right
-        # edge of the last column.
-        for c in range(cols + 1):
-            x = start_x + c * (card_w_px + gap_px)
-            draw.line([(x, 0), (x, page_h_px)], fill=CROP_MARK_COLOR, width=lw)
+        pitch_x = card_w_px + gap_px
+        pitch_y = card_h_px + gap_px
 
-        # Horizontal cut lines: at the top edge of every row + the bottom
-        # edge of the last row.
-        for r in range(rows + 1):
-            y = start_y + r * (card_h_px + gap_px)
-            draw.line([(0, y), (page_w_px, y)], fill=CROP_MARK_COLOR, width=lw)
+        # Nominal trim positions: left/right edge of every column, top/bottom
+        # edge of every row (with a gutter each card owns its own trim line).
+        xs: list[int] = []
+        for c in range(cols):
+            left = start_x + c * pitch_x
+            xs.extend((left, left + card_w_px))
+        ys: list[int] = []
+        for r in range(rows):
+            top = start_y + r * pitch_y
+            ys.extend((top, top + card_h_px))
+
+        block_left = start_x
+        block_right = start_x + cols * pitch_x - gap_px  # last column right edge
+        block_top = start_y
+        block_bottom = start_y + rows * pitch_y - gap_px  # last row bottom edge
+
+        # Vertical cut ticks in the top and bottom margins.
+        for x in xs:
+            draw.line(
+                [(x, block_top - off - mark_len), (x, block_top - off)],
+                fill=CROP_MARK_COLOR,
+                width=lw,
+            )
+            draw.line(
+                [(x, block_bottom + off), (x, block_bottom + off + mark_len)],
+                fill=CROP_MARK_COLOR,
+                width=lw,
+            )
+
+        # Horizontal cut ticks in the left and right margins.
+        for y in ys:
+            draw.line(
+                [(block_left - off - mark_len, y), (block_left - off, y)],
+                fill=CROP_MARK_COLOR,
+                width=lw,
+            )
+            draw.line(
+                [(block_right + off, y), (block_right + off + mark_len, y)],
+                fill=CROP_MARK_COLOR,
+                width=lw,
+            )
 
 
 # ----------------------------------------------------------------------

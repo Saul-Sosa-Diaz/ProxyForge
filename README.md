@@ -19,7 +19,7 @@ A containerized Python application that parses standard **Trading Card Game**
 decklists, fetches high-resolution card images using a **Strategy Pattern**,
 de-duplicates the collection, and emits assets into a dedicated deck subfolder
 alongside a print-ready PDF configured to exact physical card dimensions
-(**64 x 89 mm**) with crop marks.
+(**63 x 88 mm**) with gutter, bleed and crop marks.
 
 ---
 
@@ -51,7 +51,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
-| 🖨️ **Print-ready PDF** | Multi-page A4 grid at **800 DPI** with crop marks around every 64 x 89 mm card slot |
+| 🖨️ **Print-ready PDF** | Multi-page A4 grid at **800 DPI** with gutter, bleed and crop marks around every 63 x 88 mm card slot |
 
 ---
 
@@ -152,8 +152,8 @@ stripped from the card name before fetching. Decks without foil entries
 only produce the regular PDF.
 
 The PDFs arrange cards into a multi-page grid on A4 paper. Each card slot is
-exactly **64 x 89 mm** with subtle black crop marks at the corners to allow
-clean physical trimming after printing.
+exactly **63 x 88 mm**, separated by a 3 mm gutter with 1 mm artwork bleed into it,
+plus crop marks in the outer margins for clean physical trimming after printing.
 
 ---
 
@@ -283,9 +283,9 @@ python src/main.py --input input/my_deck.txt --output output --tcg local \
 
 | Property | Value |
 | --- | --- |
-| Card size | 64 x 89 mm |
+| Card size | 63 x 88 mm |
 | Print DPI | 800 |
-| Card pixels (at 800 DPI) | ~2016 x 2800 px |
+| Card pixels (at 800 DPI) | ~1984 x 2772 px |
 | Page size | A4 (210 x 297 mm) |
 | Grid | 3 x 3 (9 cards per page) |
 

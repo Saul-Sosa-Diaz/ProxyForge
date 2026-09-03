@@ -33,7 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Parse a TCG decklist, fetch high-resolution card images, "
             "de-duplicate the collection, and emit a print-ready PDF "
-            "(64x89 mm cards with crop marks)."
+            "(63x88 mm cards with gutter, bleed and crop marks)."
         ),
     )
     parser.add_argument(
