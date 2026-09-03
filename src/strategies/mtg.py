@@ -411,8 +411,11 @@ class MTGStrategy(TCGStrategy):
 # Module-level helpers
 # ----------------------------------------------------------------------
 _SET_ANNOTATION = re.compile(
-    r"\s*(?:\[(?P<brackets>[A-Za-z0-9]{2,8})\]|\((?P<parens>[A-Za-z0-9]{2,8})\))"
-    r"(?:\s+(?P<collector>\d{1,4}))?\s*$"
+    r"\s*(?:\*+\s*[A-Za-z0-9]{0,3}\s*\*+\s*)?"                  # premium marker, e.g. *F*
+    r"(?:[\(\[]\s*(?P<set>[A-Za-z0-9]{1,8})\s*[\)\]]\s*)?"     # set code: (2x2) or [MH2]
+    r"(?:#?\s*(?P<collector>(?:\d{1,4}[A-Za-z\u2605]{0,2}|\u2605))\s*)?"  # collector number, e.g. 253s or 181a
+    r"(?:\*+\s*[A-Za-z0-9]{0,3}\s*\*+\s*)?"                    # premium marker, e.g. *F*
+    r"$"
 )
 
 
@@ -424,20 +427,25 @@ def _normalize(name: str) -> str:
 def _parse_card_reference(card_name: str) -> tuple[str, str | None]:
     """Split a decklist card name into ``(clean_name, set_code)``.
 
-    Handles the common MTG decklist set/collector annotations:
-        ``Lightning Bolt (2x2) 117`` -> ``("Lightning Bolt", "2x2")``
-        ``Counterspell [MH2]``       -> ``("Counterspell", "mh2")``
-        ``Lightning Bolt``           -> ``("Lightning Bolt", None)``
+    Handles the trailing annotations found in MTG deck exports
+    (Manabox, MTGO, Arena...):
+        ``Barad-dûr (PLTR) 253s *F*``  ->  ``("Barad-dûr", "pltr")``
+        ``Lightning Bolt (2x2) 117``   ->  ``("Lightning Bolt", "2x2")``
+        ``Counterspell [MH2]``         ->  ``("Counterspell", "mh2")``
+        ``Lightning Bolt``             ->  ``("Lightning Bolt", None)``
+
+    where ``*F*``/``*G*``/``*S*`` are foil/premium markers and collector
+    numbers may carry letter suffixes (``253s``, ``181a``) or a star.
     """
     name = card_name.strip()
     match = _SET_ANNOTATION.search(name)
     if not match:
         return name, None
-    set_code = match.group("brackets") or match.group("parens")
+    set_code = match.group("set")
     clean = name[: match.start()].strip()
     if not clean:
         return name, None
-    return clean, set_code.lower()
+    return clean, set_code.lower() if set_code else None
 
 
 def _candidate_keys(card_name: str) -> list[str]:

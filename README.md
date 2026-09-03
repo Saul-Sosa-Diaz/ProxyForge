@@ -140,11 +140,18 @@ For a deck file named `my_awesome_deck.txt`, the application produces:
 
 ```text
 output/my_awesome_deck/
-├── images/                      # uniquely downloaded card images
-└── my_awesome_deck_printable.pdf
+├── images/                              # uniquely downloaded card images
+├── my_awesome_deck_printable.pdf        # regular cards
+└── my_awesome_deck_printable_foil.pdf   # foil entries only (when present)
 ```
 
-The PDF arranges cards into a multi-page grid on A4 paper. Each card slot is
+Decklist entries marked as foil/premium with a trailing `*F*` (Manabox) or
+`*G*` (MTGO) are rendered into their own `_printable_foil.pdf` so they can
+be printed on separate (e.g. holographic) paper stock; the marker is
+stripped from the card name before fetching. Decks without foil entries
+only produce the regular PDF.
+
+The PDFs arrange cards into a multi-page grid on A4 paper. Each card slot is
 exactly **64 x 89 mm** with subtle black crop marks at the corners to allow
 clean physical trimming after printing.
 
@@ -185,9 +192,10 @@ The MTG strategy resolves each card through the **Scryfall API**
 (`https://api.scryfall.com`):
 
 1. `GET /cards/named` — exact match first, fuzzy match second, so typos and
-   accent variations still resolve. Decklist set annotations are understood
-   and forwarded: `Lightning Bolt (2x2) 117` → `exact=Lightning Bolt` +
-   `set=2x2`.
+   accent variations still resolve. Decklist annotations are understood and
+   forwarded: set code, collector number and foil/premium markers
+   (`Lightning Bolt (2x2) 117`, `Barad-dûr (PLTR) 253s *F*` →
+   `exact=Barad-dûr` + `set=pltr`).
 2. `GET /cards/search` — last-resort search for names the named lookup
    cannot resolve.
 3. [Moxfield](https://moxfield.com) — final fallback when Scryfall cannot

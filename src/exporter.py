@@ -71,14 +71,37 @@ class Exporter:
     # Public entry point
     # ------------------------------------------------------------------
     def export_deck(self, deck_name: str, cards: list[DeckCard]) -> Path:
+        """Download images and emit one PDF per finish (regular / foil).
+
+        Foil entries (``DeckCard.foil``) are rendered into
+        ``<deck_name>_printable_foil.pdf`` so they can be printed on
+        separate (e.g. holographic) stock; the remaining cards go into
+        ``<deck_name>_printable.pdf``. A PDF is only built for a finish
+        that has at least one card.
+        """
         deck_dir = self.output_base / deck_name
         images_dir = deck_dir / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
 
         expanded = self._download_unique_cards(cards, images_dir)
-        pdf_path = deck_dir / f"{deck_name}_printable.pdf"
-        self._build_pdf(expanded, pdf_path)
-        logger.info("PDF written to %s", pdf_path)
+        regular = [(path, qty) for path, qty, foil in expanded if not foil]
+        foils = [(path, qty) for path, qty, foil in expanded if foil]
+        if not regular and not foils:
+            raise RuntimeError("No images available to build the PDF.")
+
+        pdf_path: Path | None = None
+        if regular:
+            pdf_path = deck_dir / f"{deck_name}_printable.pdf"
+            self._build_pdf(regular, pdf_path)
+            logger.info("PDF written to %s", pdf_path)
+        if foils:
+            foil_pdf_path = deck_dir / f"{deck_name}_printable_foil.pdf"
+            self._build_pdf(foils, foil_pdf_path)
+            logger.info("Foil PDF written to %s", foil_pdf_path)
+            pdf_path = pdf_path or foil_pdf_path
+        else:
+            logger.debug("Deck '%s' has no foil cards; no foil PDF generated.", deck_name)
+        assert pdf_path is not None
         return pdf_path
 
     # ------------------------------------------------------------------
@@ -88,13 +111,15 @@ class Exporter:
         self,
         cards: list[DeckCard],
         images_dir: Path,
-    ) -> list[tuple[Path, int]]:
+    ) -> list[tuple[Path, int, bool]]:
         """Download each unique card once and expand quantities after the fact.
 
-        Returns a list of ``(image_path, quantity)`` tuples in deck order.
+        Returns a list of ``(image_path, quantity, foil)`` tuples in deck
+        order. The same image is shared by entries that only differ in
+        finish (foil vs regular).
         """
         unique: dict[str, Path] = {}
-        expanded: list[tuple[Path, int]] = []
+        expanded: list[tuple[Path, int, bool]] = []
 
         for card in cards:
             key = _sanitize_filename(card.name)
@@ -111,7 +136,7 @@ class Exporter:
                             image_path.unlink(missing_ok=True)
                         continue
                 unique[key] = image_path
-            expanded.append((image_path, card.quantity))
+            expanded.append((image_path, card.quantity, card.foil))
 
         return expanded
 

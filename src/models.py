@@ -9,6 +9,10 @@ class DeckCard(BaseModel):
 
     quantity: int = Field(gt=0, description="Number of copies of the card.")
     name: str = Field(min_length=1, description="Full card name.")
+    foil: bool = Field(
+        default=False,
+        description="True when the decklist marks the card as foil/premium (e.g. a trailing '*F*').",
+    )
 
 
 class DownloadResult(BaseModel):
