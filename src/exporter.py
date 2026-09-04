@@ -136,20 +136,25 @@ class Exporter:
 
         Returns a list of ``(image_path, quantity, foil)`` tuples in deck
         order. The same image is shared by entries that only differ in
-        finish (foil vs regular).
+        finish (foil vs regular); entries with a different ``[art]`` marker
+        get their own image file.
         """
         unique: dict[str, Path] = {}
         expanded: list[tuple[Path, int, bool]] = []
 
         for card in cards:
             key = _sanitize_filename(card.name)
+            if card.art:
+                key = f"{key}_{card.art}"
             if key in unique:
                 image_path = unique[key]
             else:
                 image_path = images_dir / f"{key}.png"
                 if not image_path.exists():
                     logger.info("Fetching image for '%s'...", card.name)
-                    ok = self.strategy.fetch_card_image(card.name, str(image_path))
+                    ok = self.strategy.fetch_card_image(
+                        card.name, str(image_path), art=card.art
+                    )
                     if not ok:
                         logger.warning("Failed to fetch image for '%s'", card.name)
                         if image_path.exists():

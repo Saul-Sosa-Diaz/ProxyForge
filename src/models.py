@@ -13,6 +13,15 @@ class DeckCard(BaseModel):
         default=False,
         description="True when the decklist marks the card as foil/premium (e.g. a trailing '*F*').",
     )
+    art: str | None = Field(
+        default=None,
+        description=(
+            "Art variant requested for this card via a trailing '[variant]' marker "
+            "(e.g. '[enchanted]'). Only honored by strategies that support art "
+            "selection (Lorcana); when unset the strategy default applies (best "
+            "available art)."
+        ),
+    )
 
 
 class DownloadResult(BaseModel):

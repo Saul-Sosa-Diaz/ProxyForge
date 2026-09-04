@@ -20,7 +20,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from .base import TCGStrategy
+from .base import TCGStrategy, warn_unsupported_art
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,13 @@ class LocalStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def fetch_card_image(self, card_name: str, output_path: str) -> bool:
+    def fetch_card_image(
+        self,
+        card_name: str,
+        output_path: str,
+        art: str | None = None,
+    ) -> bool:
+        warn_unsupported_art(card_name, art)
         source = self._resolve_local_file(card_name)
         if source is None:
             logger.warning(

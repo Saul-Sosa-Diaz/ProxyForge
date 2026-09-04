@@ -40,7 +40,7 @@ from typing import Any
 
 import requests
 
-from .base import TCGStrategy
+from .base import TCGStrategy, warn_unsupported_art
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,13 @@ class MTGStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def fetch_card_image(self, card_name: str, output_path: str) -> bool:
+    def fetch_card_image(
+        self,
+        card_name: str,
+        output_path: str,
+        art: str | None = None,
+    ) -> bool:
+        warn_unsupported_art(card_name, art)
         image_url = self._resolve_image_url(card_name)
         if not image_url:
             return False

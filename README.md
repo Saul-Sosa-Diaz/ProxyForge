@@ -43,9 +43,9 @@ alongside a print-ready PDF configured to exact physical card dimensions
 
 | | |
 |---|---|
-| 📝 **Standard parsing** | Reads decklists in `<quantity> <full card name>` format |
+| 📝 **Standard parsing** | Reads decklists in `<quantity> <full card name>` format with optional `[art]` and foil markers |
 | 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
-| 🃏 **Lorcana** | Queries the **LorcanaJSON** API, caches locally, and falls back to scraping `lorcana.gg` |
+| 🃏 **Lorcana** | Queries the **LorcanaJSON** API, caches locally, and falls back to scraping `lorcana.gg`; `[art]` decklist markers select the card art (default: most premium available) |
 | ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
 | 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) (exact + fuzzy name lookup, high-res `png` imagery) with a local cache, search fallback, and a final [Moxfield](https://moxfield.com) fallback |
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
@@ -60,7 +60,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 Each non-empty line of the deck file must follow:
 
 ```text
-<quantity> <full card name>
+<quantity> <full card name> [art] [*F*]
 ```
 
 **Example** (`input/my_awesome_deck.txt`):
@@ -68,12 +68,14 @@ Each non-empty line of the deck file must follow:
 ```text
 4 Daisy Duck - Donald's Date
 2 Emerald Chromicon
+2 Hades - King of Olympus [enchanted]
 4 Lilo - Escape Artist
 4 Tramp - Enterprising Dog
 4 Tramp - Street-Smart Dog
 4 Lady - Decisive Dog
 4 Bobby Zimuruski - Spray Cheese Kid
 2 Under the Sea
+2 A Whole New World [base]
 4 Mowgli - Man Cub
 4 Grandmother Willow - Ancient Advisor
 4 Mulan - Resourceful Recruit
@@ -88,6 +90,14 @@ Each non-empty line of the deck file must follow:
 > 💡 The deck file's base name (without extension) automatically becomes the
 > output subfolder name.
 > E.g. `my_awesome_deck.txt` → `output/my_awesome_deck/`
+
+**Optional per-card markers** (may appear in either order at the end of the line):
+
+- `[art]` — requests a specific art variant for that card (Lorcana only):
+  `best`, `enchanted`, `iconic`, `epic`, `special` or `base`. Cards without
+  the marker use the most premium art available, and only the known keywords
+  are stripped, so bracketed text belonging to a card name is left untouched.
+- `*F*` / `*G*` — foil/premium marker (see [Output](#-output)).
 
 ---
 
@@ -106,7 +116,7 @@ To process a different deck, override the command:
 
 ```bash
 docker compose run --rm tcg-downloader \
-  src/main.py --input ./input/my_deck.txt --tcg lorcana
+  src/main.py --input ./input/mtg/tmnt.txt --tcg mtg
 ```
 
 ### Option B — Local Python
@@ -183,6 +193,40 @@ Each card in the cache follows the LorcanaJSON schema; the strategy reads the
 Force a refresh of the cached database with `--refresh-db`. When a card is
 not present in the LorcanaJSON database, the strategy falls back to scraping
 `https://lorcana.gg/cards/`.
+
+### 🎨 Art Selection (`[art]` decklist marker)
+
+Most Lorcana cards exist in several art variants that share the same name:
+the standard printing plus alternate-art premium versions (Enchanted, Iconic,
+Epic, and Special/promo). LorcanaJSON lists each variant as its own entry,
+ranked here from most to least premium:
+
+```text
+Enchanted > Iconic > Epic > Special (promo) > Legendary > Super Rare > Rare > Uncommon > Common
+```
+
+A trailing `[art]` marker on a decklist line requests a specific variant for
+that card. **Cards without a marker always download the most premium art
+available** (usually Enchanted — the most expensive and typically the
+prettiest):
+
+```text
+4 Hades - King of Olympus [enchanted]   <- always the Enchanted art
+2 A Whole New World [base]              <- always the standard art
+4 Lilo - Escape Artist                  <- best available art (default)
+```
+
+| Value | Behaviour |
+| --- | --- |
+| *(no marker)* — default | Picks the most premium art available for the card. |
+| `best` | Same as no marker. |
+| `enchanted` / `iconic` / `epic` / `special` | Requests that specific art; if the card has no such version, falls back to the default and logs it. |
+| `base` | Picks the standard (non-premium) printing. |
+
+> ⚠️ Art selection is Lorcana-specific. The other TCG strategies resolve their
+> printings differently (MTG via set code / collector number in the decklist
+> name, Pokémon via pkmncards.com naming) and ignore `[art]` markers entirely;
+> a warning is logged when a marker is used with another `--tcg`.
 
 ---
 

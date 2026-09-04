@@ -6,6 +6,15 @@ Resolution order:
        indexed by card ``fullName`` / ``simpleName`` for high-speed lookup.
     2. Web scraping fallback on https://lorcana.gg/cards/ when a card is not
        present in the LorcanaJSON database.
+
+Art selection:
+    Most cards exist in several art variants that share the same name but
+    differ in ``rarity`` (alternate-art premium versions such as Enchanted or
+    Iconic are separate entries linked back to the base card via ``baseId``).
+    By default the most premium art available is downloaded (``best``). A
+    per-card ``[art]`` decklist marker (e.g. ``[enchanted]``, ``[base]``)
+    requests a specific variant for that card, falling back to the best
+    available one when the card has no such version.
 """
 from __future__ import annotations
 
@@ -25,11 +34,33 @@ from .base import TCGStrategy
 
 logger = logging.getLogger(__name__)
 
+# LorcanaJSON rarities ordered from most to least premium. Alternate-art
+# variants of a card (Enchanted, Iconic, Epic, Special) share its name, so
+# this ranking decides which art is "best".
+RARITY_RANK: dict[str, int] = {
+    "Enchanted": 0,
+    "Iconic": 1,
+    "Epic": 2,
+    "Special": 3,
+    "Legendary": 4,
+    "Super Rare": 5,
+    "Rare": 6,
+    "Uncommon": 7,
+    "Common": 8,
+}
+_UNRANKED_RARITY = len(RARITY_RANK)
+
+# Valid values for a per-card ``[art]`` decklist marker: "best"/"base" are
+# modes, the rest request a specific alternate-art rarity by name.
+ART_CHOICES = ("best", "enchanted", "iconic", "epic", "special", "base")
+DEFAULT_ART = "best"
+
 
 class LorcanaStrategy(TCGStrategy):
     """Fetch Lorcana card images via LorcanaJSON with a lorcana.gg fallback."""
 
     name = "lorcana"
+    supports_art = True
 
     LORCANAJSON_ZIP_URL = "https://lorcanajson.org/files/current/en/allCards.json.zip"
     LORCANAJSON_JSON_URL = "https://lorcanajson.org/files/current/en/allCards.json"
@@ -49,7 +80,12 @@ class LorcanaStrategy(TCGStrategy):
         self.timeout = timeout
         self.refresh_db = refresh_db
         self.cache_ttl_seconds = cache_ttl_seconds
-        self._db_index: dict[str, str] | None = None
+        # art mode -> name key -> (art score, rarity, image URL); lowest
+        # score wins. One index per mode, built lazily so per-card ``[art]``
+        # markers only build the modes they actually use.
+        self._db_indexes: dict[str, dict[str, tuple[tuple[int, int], str, str]] | None] = {}
+        # Raw card list shared by all index builds (loaded once).
+        self._cards: list[dict[str, Any]] | None = None
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -63,8 +99,13 @@ class LorcanaStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def fetch_card_image(self, card_name: str, output_path: str) -> bool:
-        image_url = self._resolve_image_url(card_name)
+    def fetch_card_image(
+        self,
+        card_name: str,
+        output_path: str,
+        art: str | None = None,
+    ) -> bool:
+        image_url = self._resolve_image_url(card_name, art)
         if not image_url:
             return False
         return self._download_image(image_url, output_path)
@@ -72,8 +113,8 @@ class LorcanaStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     # Resolution helpers
     # ------------------------------------------------------------------
-    def _resolve_image_url(self, card_name: str) -> str | None:
-        url = self._lookup_lorcanajson(card_name)
+    def _resolve_image_url(self, card_name: str, art: str | None = None) -> str | None:
+        url = self._lookup_lorcanajson(card_name, art)
         if url:
             return url
         logger.debug("Card '%s' not found in LorcanaJSON; falling back to lorcana.gg", card_name)
@@ -82,22 +123,45 @@ class LorcanaStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     # Source 1: LorcanaJSON API (+ local cache)
     # ------------------------------------------------------------------
-    def _lookup_lorcanajson(self, card_name: str) -> str | None:
-        index = self._get_db_index()
+    def _lookup_lorcanajson(self, card_name: str, art: str | None = None) -> str | None:
+        mode = self._effective_art(art)
+        index = self._get_db_index(mode)
         if index is None:
             return None
         for key in _candidate_keys(card_name):
-            if key in index:
-                return index[key]
+            entry = index.get(key)
+            if entry is not None:
+                _score, rarity, img_url = entry
+                if mode not in ("best", "base") and rarity.lower() != mode:
+                    logger.info(
+                        "Card '%s' has no %s version; using its %s art",
+                        card_name,
+                        mode.capitalize(),
+                        rarity or "available",
+                    )
+                return img_url
         return None
 
-    def _get_db_index(self) -> dict[str, str] | None:
-        if self._db_index is not None:
-            return self._db_index
+    def _effective_art(self, art: str | None) -> str:
+        """Resolve the art mode for a card: its ``[art]`` marker or the default."""
+        if art is None:
+            return DEFAULT_ART
+        if art not in ART_CHOICES:
+            raise ValueError(f"Unknown art option: {art!r}. Valid values: {', '.join(ART_CHOICES)}")
+        return art
+
+    def _get_db_index(
+        self, mode: str
+    ) -> dict[str, tuple[tuple[int, int], str, str]] | None:
+        if mode not in self._db_indexes:
+            self._db_indexes[mode] = self._build_db_index(mode)
+        return self._db_indexes[mode]
+
+    def _build_db_index(self, mode: str) -> dict[str, tuple[tuple[int, int], str, str]] | None:
         cards = self._load_all_cards()
         if not cards:
             return None
-        index: dict[str, str] = {}
+        index: dict[str, tuple[tuple[int, int], str, str]] = {}
         for card in cards:
             if not isinstance(card, dict):
                 continue
@@ -105,18 +169,34 @@ class LorcanaStrategy(TCGStrategy):
             img_url = images.get("full") or images.get("thumbnail")
             if not img_url:
                 continue
-            full_name = card.get("fullName")
-            simple_name = card.get("simpleName")
-            if full_name:
-                index.setdefault(_normalize(full_name), img_url)
-            if simple_name:
-                index.setdefault(simple_name.lower().strip(), img_url)
-                index.setdefault(_to_simple_key(simple_name), img_url)
-        self._db_index = index
-        logger.info("LorcanaJSON index built with %d cards", len(index))
+            score = self._art_score(card, mode)
+            rarity = str(card.get("rarity") or "")
+            for key in _card_keys(card):
+                current = index.get(key)
+                if current is None or score < current[0]:
+                    index[key] = (score, rarity, img_url)
+        logger.info("LorcanaJSON index built with %d cards (art=%s)", len(index), mode)
         return index
 
+    def _art_score(self, card: dict[str, Any], mode: str) -> tuple[int, int]:
+        """Sort key deciding which art variant of a card wins the index.
+
+        Lower is better. ``RARITY_RANK`` orders variants from most premium
+        (Enchanted) to least (Common). In ``base`` mode non-premium printings
+        (no ``baseId``) win; in explicit-rarity mode an exact match wins and
+        everything else falls back to the most premium art available.
+        """
+        rarity = str(card.get("rarity") or "")
+        rank = RARITY_RANK.get(rarity, _UNRANKED_RARITY)
+        if mode == "base":
+            return (0 if "baseId" not in card else 1, rank)
+        if mode != "best":
+            return (0 if rarity.lower() == mode else 1, rank)
+        return (0, rank)
+
     def _load_all_cards(self) -> list[dict[str, Any]] | None:
+        if self._cards is not None:
+            return self._cards
         data = self._load_cache()
         if data is None:
             data = self._download_all_cards()
@@ -129,6 +209,7 @@ class LorcanaStrategy(TCGStrategy):
             cards = data
         if not isinstance(cards, list):
             return None
+        self._cards = cards
         return cards
 
     def _load_cache(self) -> dict[str, Any] | None:
@@ -293,6 +374,25 @@ def _to_simple_key(name: str) -> str:
 def _candidate_keys(card_name: str) -> list[str]:
     """Ordered lookup keys for a decklist card name."""
     keys = [_normalize(card_name), _to_simple_key(card_name)]
+    seen: set[str] = set()
+    unique: list[str] = []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            unique.append(k)
+    return unique
+
+
+def _card_keys(card: dict[str, Any]) -> list[str]:
+    """Deduplicated index keys (normalized + simpleName forms) for a card."""
+    keys: list[str] = []
+    full_name = card.get("fullName")
+    simple_name = card.get("simpleName")
+    if full_name:
+        keys.append(_normalize(str(full_name)))
+    if simple_name:
+        keys.append(simple_name.lower().strip())
+        keys.append(_to_simple_key(str(simple_name)))
     seen: set[str] = set()
     unique: list[str] = []
     for k in keys:
