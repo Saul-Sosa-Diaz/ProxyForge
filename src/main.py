@@ -64,19 +64,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--db-cache",
-        default=None,
-        help=(
-            "Path to the strategy cache file (Lorcana/MTG). Auto-created on first run. "
-            "Defaults: data/lorcana_cache.json (Lorcana), data/mtg_cache.json (MTG)."
-        ),
-    )
-    parser.add_argument(
-        "--refresh-db",
-        action="store_true",
-        help="Force re-resolution of cards, ignoring the local cache (Lorcana/MTG).",
-    )
-    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -95,23 +82,15 @@ _STRATEGY_REGISTRY: dict[str, type[TCGStrategy]] = {
 
 def _make_strategy(
     name: str,
-    db_cache: str | None,
-    refresh_db: bool,
     local_dir: str | None,
 ) -> TCGStrategy:
     cls = _STRATEGY_REGISTRY.get(name)
     if cls is None:
         raise ValueError(f"Unknown TCG strategy: {name}")
     if cls is LorcanaStrategy:
-        return LorcanaStrategy(
-            cache_path=db_cache,
-            refresh_db=refresh_db,
-        )
+        return LorcanaStrategy()
     if cls is MTGStrategy:
-        return MTGStrategy(
-            cache_path=db_cache,
-            refresh_db=refresh_db,
-        )
+        return MTGStrategy()
     if cls is LocalStrategy:
         return LocalStrategy(images_dir=local_dir)
     return cls()
@@ -137,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Parsed deck '%s' with %d unique card entries.", deck_name, len(cards))
 
     try:
-        strategy = _make_strategy(args.tcg, args.db_cache, args.refresh_db, args.local_dir)
+        strategy = _make_strategy(args.tcg, args.local_dir)
     except ValueError as exc:
         logger.error("%s", exc)
         return 2

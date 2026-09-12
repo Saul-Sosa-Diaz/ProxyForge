@@ -17,8 +17,9 @@ class DeckCard(BaseModel):
         default=None,
         description=(
             "Art variant requested for this card via a trailing '[variant]' marker "
-            "(e.g. '[enchanted]'). Only honored by strategies that support art "
-            "selection (Lorcana); when unset the strategy default applies (best "
+            "(Lorcana: '[enchanted]'; MTG: '[m21]', '[2x2:117]', '[borderless]', "
+            "'[m21 borderless]'). Only honored by strategies that support art "
+            "selection (Lorcana, MTG); when unset the strategy default applies (best "
             "available art)."
         ),
     )

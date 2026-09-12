@@ -2,8 +2,8 @@
 
 Resolution order:
     1. LorcanaJSON API (``https://lorcanajson.org/files/current/en/allCards.json.zip``)
-       Downloaded once, cached locally to avoid repeated large downloads, and
-       indexed by card ``fullName`` / ``simpleName`` for high-speed lookup.
+       Downloaded fresh on every run and indexed by card ``fullName`` /
+       ``simpleName`` for high-speed lookup.
     2. Web scraping fallback on https://lorcana.gg/cards/ when a card is not
        present in the LorcanaJSON database.
 
@@ -22,7 +22,6 @@ import io
 import json
 import logging
 import re
-import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -69,17 +68,11 @@ class LorcanaStrategy(TCGStrategy):
 
     def __init__(
         self,
-        cache_path: str | None = None,
         api_url: str | None = None,
         timeout: int = DEFAULT_TIMEOUT,
-        refresh_db: bool = False,
-        cache_ttl_seconds: float | None = None,
     ) -> None:
-        self.cache_path = Path(cache_path) if cache_path else Path("data/lorcana_cache.json")
         self.api_url = api_url or self.LORCANAJSON_ZIP_URL
         self.timeout = timeout
-        self.refresh_db = refresh_db
-        self.cache_ttl_seconds = cache_ttl_seconds
         # art mode -> name key -> (art score, rarity, image URL); lowest
         # score wins. One index per mode, built lazily so per-card ``[art]``
         # markers only build the modes they actually use.
@@ -121,7 +114,7 @@ class LorcanaStrategy(TCGStrategy):
         return self._scrape_lorcana_gg(card_name)
 
     # ------------------------------------------------------------------
-    # Source 1: LorcanaJSON API (+ local cache)
+    # Source 1: LorcanaJSON API (downloaded fresh on every run)
     # ------------------------------------------------------------------
     def _lookup_lorcanajson(self, card_name: str, art: str | None = None) -> str | None:
         mode = self._effective_art(art)
@@ -147,7 +140,15 @@ class LorcanaStrategy(TCGStrategy):
         if art is None:
             return DEFAULT_ART
         if art not in ART_CHOICES:
-            raise ValueError(f"Unknown art option: {art!r}. Valid values: {', '.join(ART_CHOICES)}")
+            # MTG-style markers (set codes, variants...) may reach Lorcana when
+            # a decklist is reused with another --tcg: warn and fall back
+            # instead of aborting the whole export.
+            logger.warning(
+                "Art marker '[%s]' is not a Lorcana art option (%s); using default art.",
+                art,
+                ", ".join(ART_CHOICES),
+            )
+            return DEFAULT_ART
         return art
 
     def _get_db_index(
@@ -197,12 +198,9 @@ class LorcanaStrategy(TCGStrategy):
     def _load_all_cards(self) -> list[dict[str, Any]] | None:
         if self._cards is not None:
             return self._cards
-        data = self._load_cache()
+        data = self._download_all_cards()
         if data is None:
-            data = self._download_all_cards()
-            if data is None:
-                return None
-            self._save_cache(data)
+            return None
         if isinstance(data, dict):
             cards = data.get("cards") or data.get("data") or []
         else:
@@ -211,31 +209,6 @@ class LorcanaStrategy(TCGStrategy):
             return None
         self._cards = cards
         return cards
-
-    def _load_cache(self) -> dict[str, Any] | None:
-        if self.refresh_db or not self.cache_path.exists():
-            return None
-        if self.cache_ttl_seconds is not None:
-            age = time.time() - self.cache_path.stat().st_mtime
-            if age > self.cache_ttl_seconds:
-                return None
-        try:
-            with self.cache_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to read LorcanaJSON cache '%s': %s", self.cache_path, exc)
-            return None
-        logger.info("Loaded LorcanaJSON cache from %s", self.cache_path)
-        return data
-
-    def _save_cache(self, data: dict[str, Any]) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with self.cache_path.open("w", encoding="utf-8") as f:
-                json.dump(data, f)
-            logger.info("Saved LorcanaJSON cache to %s", self.cache_path)
-        except OSError as exc:
-            logger.warning("Failed to write LorcanaJSON cache '%s': %s", self.cache_path, exc)
 
     def _download_all_cards(self) -> dict[str, Any] | None:
         logger.info("Downloading LorcanaJSON database from %s", self.api_url)

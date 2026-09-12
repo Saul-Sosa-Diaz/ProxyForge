@@ -13,7 +13,7 @@ def warn_unsupported_art(card_name: str, art: str | None) -> None:
     if art is not None:
         logger.warning(
             "Art marker '[%s]' on card '%s' is only supported by the Lorcana "
-            "strategy; ignoring it.",
+            "and MTG strategies; ignoring it.",
             art,
             card_name,
         )

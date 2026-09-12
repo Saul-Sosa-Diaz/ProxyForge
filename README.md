@@ -30,7 +30,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 - [Usage](#-usage)
 - [CLI Arguments](#-cli-arguments)
 - [Output](#-output)
-- [LorcanaJSON Database & Cache](#-lorcanajson-database--cache-lorcana)
+- [LorcanaJSON Database](#-lorcanajson-database-lorcana)
 - [PkmnCards Naming](#-pkmncards-naming-pokémon)
 - [Local Images](#-local-images-local)
 - [Print Dimensions](#-print-dimensions)
@@ -45,9 +45,9 @@ alongside a print-ready PDF configured to exact physical card dimensions
 |---|---|
 | 📝 **Standard parsing** | Reads decklists in `<quantity> <full card name>` format with optional `[art]` and foil markers |
 | 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
-| 🃏 **Lorcana** | Queries the **LorcanaJSON** API, caches locally, and falls back to scraping `lorcana.gg`; `[art]` decklist markers select the card art (default: most premium available) |
+| 🃏 **Lorcana** | Queries the **LorcanaJSON** API on every run, and falls back to scraping `lorcana.gg`; `[art]` decklist markers select the card art (default: most premium available) |
 | ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
-| 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) (exact + fuzzy name lookup, high-res `png` imagery) with a local cache, search fallback, and a final [Moxfield](https://moxfield.com) fallback |
+| 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) live on every run (exact + fuzzy name lookup, collector-number lookup, variant/base art search, high-res `png` imagery) with a search fallback and a final [Moxfield](https://moxfield.com) fallback; `[art]` decklist markers select set / variant / printing |
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
@@ -93,11 +93,27 @@ Each non-empty line of the deck file must follow:
 
 **Optional per-card markers** (may appear in either order at the end of the line):
 
-- `[art]` — requests a specific art variant for that card (Lorcana only):
-  `best`, `enchanted`, `iconic`, `epic`, `special` or `base`. Cards without
-  the marker use the most premium art available, and only the known keywords
-  are stripped, so bracketed text belonging to a card name is left untouched.
+- `[art]` — requests a specific art variant for that card (Lorcana and MTG;
+  see [Art Selection](#-art-selection-lorcana--mtg)): Lorcana accepts `best`,
+  `enchanted`, `iconic`, `epic`, `special` or `base`; MTG accepts a set code
+  (`[m21]`), a set + collector number (`[2x2:117]`), a variant (`[fullart]`,
+  `[borderless]`, `[showcase]`, `[extended]`, `[retro]`, `[promo]`,
+  `[base]`/`[best]`) or a set (+collector) + variant combo
+  (`[m21 borderless]`, `[2x2:117 showcase]`). Cards without the marker use
+  the strategy default (Lorcana: most premium art available; MTG: Scryfall's
+  default printing), and only recognized art expressions are stripped, so
+  bracketed text belonging to a card name is left untouched.
 - `*F*` / `*G*` — foil/premium marker (see [Output](#-output)).
+
+**MTG example** (`input/mtg/sneaky.txt` with art picks):
+
+```text
+4 Lightning Bolt [m21]
+2 Counterspell [mh2] *F*
+4 Llanowar Elves [dmu:169]
+2 Sol Ring [borderless]
+4 Ragavan, Nimble Pilferer [mh2 showcase]
+```
 
 ---
 
@@ -137,9 +153,7 @@ python src/main.py --input input/my_awesome_deck.txt --output output --tcg lorca
 | `--input` | `-i` | _required_ | Path to the standard `.txt` deck file. |
 | `--output` | `-o` | `/app/output` | Base output directory. |
 | `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`, `local`). |
-| `--db-cache` | | per strategy | Path to the strategy cache file (Lorcana/MTG). Auto-created on first run. Defaults: `data/lorcana_cache.json`, `data/mtg_cache.json`. |
 | `--local-dir` | | `input/images` | Directory with local card images (Local only). Card names in the decklist must match the local file names. |
-| `--refresh-db` | | off | Force re-resolution of cards, ignoring the local cache (Lorcana/MTG). |
 | `--verbose` | `-v` | off | Enable verbose logging. |
 
 ---
@@ -167,14 +181,13 @@ plus crop marks in the outer margins for clean physical trimming after printing.
 
 ---
 
-## 🗄️ LorcanaJSON Database & Cache (Lorcana)
+## 🗄️ LorcanaJSON Database (Lorcana)
 
-On the first run the Lorcana strategy downloads the full card database from
+On every run the Lorcana strategy downloads the full card database from
 **LorcanaJSON** (`https://lorcanajson.org/files/current/en/allCards.json.zip`)
-and saves it to `data/lorcana_cache.json` (override with `--db-cache`).
-Subsequent runs load the cache instantly instead of re-downloading.
+— nothing is cached on disk.
 
-Each card in the cache follows the LorcanaJSON schema; the strategy reads the
+Each card in the database follows the LorcanaJSON schema; the strategy reads the
 `fullName` / `simpleName` fields for matching and the `images.full` URL
 (usually 1468 x 2048 px) for downloads.
 
@@ -190,11 +203,10 @@ Each card in the cache follows the LorcanaJSON schema; the strategy reads the
 }
 ```
 
-Force a refresh of the cached database with `--refresh-db`. When a card is
-not present in the LorcanaJSON database, the strategy falls back to scraping
-`https://lorcana.gg/cards/`.
+When a card is not present in the LorcanaJSON database, the strategy falls
+back to scraping `https://lorcana.gg/cards/`.
 
-### 🎨 Art Selection (`[art]` decklist marker)
+### 🎨 Art Selection (`[art]` decklist marker, Lorcana + MTG)
 
 Most Lorcana cards exist in several art variants that share the same name:
 the standard printing plus alternate-art premium versions (Enchanted, Iconic,
@@ -206,7 +218,7 @@ Enchanted > Iconic > Epic > Special (promo) > Legendary > Super Rare > Rare > Un
 ```
 
 A trailing `[art]` marker on a decklist line requests a specific variant for
-that card. **Cards without a marker always download the most premium art
+that card. **Lorcana cards without a marker always download the most premium art
 available** (usually Enchanted — the most expensive and typically the
 prettiest):
 
@@ -216,33 +228,64 @@ prettiest):
 4 Lilo - Escape Artist                  <- best available art (default)
 ```
 
-| Value | Behaviour |
+| Value | Behaviour (Lorcana) |
 | --- | --- |
 | *(no marker)* — default | Picks the most premium art available for the card. |
 | `best` | Same as no marker. |
 | `enchanted` / `iconic` / `epic` / `special` | Requests that specific art; if the card has no such version, falls back to the default and logs it. |
 | `base` | Picks the standard (non-premium) printing. |
 
-> ⚠️ Art selection is Lorcana-specific. The other TCG strategies resolve their
-> printings differently (MTG via set code / collector number in the decklist
-> name, Pokémon via pkmncards.com naming) and ignore `[art]` markers entirely;
-> a warning is logged when a marker is used with another `--tcg`.
+MTG cards work the same way: a trailing `[art]` marker picks the printing.
+The marker may be a set code, a set + collector number, a frame variant, or
+a set (+collector) + variant combo (the `[art]` set always wins over a
+`(SET)` annotation in the card name):
+
+```text
+4 Lightning Bolt [m21]                 <- that set's default printing
+4 Lightning Bolt [2x2:117]             <- exact printing (collector endpoint)
+2 Sol Ring [borderless]                <- newest borderless printing
+4 Ragavan, Nimble Pilferer [mh2 showcase]  <- showcase within MH2
+2 Counterspell [base]                  <- newest standard printing
+4 Llanowar Elves                       <- Scryfall default (no marker / [best])
+```
+
+| Value | Behaviour (MTG) |
+| --- | --- |
+| *(no marker)* / `best` — default | Scryfall's default printing (`/cards/named`). |
+| `<set>` (e.g. `m21`, `2x2`) | That set's default printing (`/cards/named?set=...`). |
+| `<set>:<collector>` (e.g. `2x2:117`, `2x2-117`, `pltr 253s`) | Exact printing (`/cards/<set>/<collector>`). |
+| `fullart` / `borderless` / `showcase` / `extended` / `retro` / `promo` | Newest printing matching that treatment (`/cards/search` `unique:prints`, filtered by `full_art` / `border_color` / `frame_effects` / `frame` / `promo`). Falls back to default with a log when nothing matches. |
+| `base` (`normal` / `standard` aliases) | Newest standard printing (no promo, no full-art/borderless/showcase/extended). |
+| `<set> <variant>` / `<set>:<collector> <variant>` (e.g. `m21 borderless`, `2x2:117 showcase`) | Variant filtered within that set/printing. |
+
+> ⚠️ Lorcana-only markers (`[enchanted]`, `[iconic]`, `[epic]`, `[special]`)
+> are ignored with a warning when used with `--tcg mtg` (and vice versa:
+> MTG set/variant markers are ignored with a warning under `--tcg lorcana`).
+> Pokémon and Local ignore `[art]` markers entirely with a warning.
 
 ---
 
-## 🔮 Scryfall Lookup & Cache (Magic: The Gathering)
+## 🔮 Scryfall Lookup (Magic: The Gathering)
 
-The MTG strategy resolves each card through the **Scryfall API**
-(`https://api.scryfall.com`):
+The MTG strategy resolves each card live through the **Scryfall API**
+(`https://api.scryfall.com`) — nothing is cached on disk:
 
-1. `GET /cards/named` — exact match first, fuzzy match second, so typos and
-   accent variations still resolve. Decklist annotations are understood and
-   forwarded: set code, collector number and foil/premium markers
-   (`Lightning Bolt (2x2) 117`, `Barad-dûr (PLTR) 253s *F*` →
-   `exact=Barad-dûr` + `set=pltr`).
-2. `GET /cards/search` — last-resort search for names the named lookup
+1. `GET /cards/<set>/<collector>` — exact printing when the decklist pins
+   one (`Lightning Bolt (2x2) 117`) or the `[art]` marker does (`[2x2:117]`).
+2. `GET /cards/search` with `unique:prints` — variant / base art selection
+   (`[borderless]`, `[showcase]`, `[fullart]`, `[extended]`, `[retro]`,
+   `[promo]`, `[base]`), optionally narrowed to a set (`[m21 borderless]`,
+   `[2x2:117 showcase]`). Prints are filtered client-side by Scryfall card
+   fields and the newest match wins; with no match the default art is used.
+3. `GET /cards/named` — exact match first, fuzzy match second, so typos and
+   accent variations still resolve. Decklist annotations and `[art]` sets are
+   understood and forwarded: set code, collector number and foil/premium markers
+   (`Lightning Bolt (2x2) 117`, `Barad-dûr (PLTR) 253s *F*`,
+   `Lightning Bolt [m21]` → `exact=Lightning Bolt` + `set=m21`; the `[art]`
+   set wins over a `(SET)` annotation).
+4. `GET /cards/search` — last-resort search for names the named lookup
    cannot resolve.
-3. [Moxfield](https://moxfield.com) — final fallback when Scryfall cannot
+5. [Moxfield](https://moxfield.com) — final fallback when Scryfall cannot
    resolve the card at all. The card is looked up via Moxfield's search API
    (the JSON backend of `moxfield.com/cards/search`) and the image is taken
    from their assets CDN (`assets.moxfield.net/cards/card-<id>-normal.jpg`),
@@ -254,9 +297,7 @@ Images are downloaded from the Scryfall image CDN in the highest-quality
 versions (`large`, `normal`, `border_crop`, `small`) act as fallbacks.
 Double-faced cards use the front face (`card_faces[0].image_uris`).
 
-Resolved names are cached in `data/mtg_cache.json` (override with
-`--db-cache`, force re-resolution with `--refresh-db`) so subsequent runs
-skip the API entirely, following Scryfall's caching guidelines. Scryfall's
+Every card is resolved live on each run. Scryfall's
 rate limits are honored: a 500 ms minimum interval between API requests and
 `Retry-After` handling on HTTP 429 (see
 [Rate Limits](https://scryfall.com/docs/api/rate-limits)).

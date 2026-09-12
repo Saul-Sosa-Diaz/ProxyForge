@@ -1,8 +1,6 @@
 .ruff_cache
 .venv
 **__pycache__/
-/data/lorcana_cache.json
-/data/mtg_cache.json
 /output/
 /input/
 !input\my_awesome_deck.txt
