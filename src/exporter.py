@@ -216,9 +216,7 @@ class Exporter:
         unique: dict[str, Path],
     ) -> Path | None:
         """Fetch one face image (de-duplicated); ``None`` on failure."""
-        key = _sanitize_filename(name)
-        if art:
-            key = f"{key}_{art}"
+        key = _image_key(name, art)
         if key in unique:
             return unique[key]
         image_path = images_dir / f"{key}.png"
@@ -247,6 +245,9 @@ class Exporter:
         a different ``[art]`` marker get their own image file. A failed
         front download skips the whole entry (its back has no slot to
         align to); a failed back download degrades to a blank back slot.
+        Entries without an explicit ``/ Back`` ask the strategy for an
+        automatic back face (e.g. MTG double-faced cards), so a single
+        decklist line can still yield both sides.
         """
         unique: dict[str, Path] = {}
         expanded: list[tuple[Path, Path | None, int, bool]] = []
@@ -272,9 +273,41 @@ class Exporter:
                     back_path = None
                 else:
                     back_path = fetched_back
+            else:
+                back_path = self._fetch_automatic_back(
+                    card.name, card.art, images_dir, unique
+                )
             expanded.append((front_path, back_path, card.quantity, card.foil))
 
         return expanded
+
+    def _fetch_automatic_back(
+        self,
+        name: str,
+        art: str | None,
+        images_dir: Path,
+        unique: dict[str, Path],
+    ) -> Path | None:
+        """Fetch a strategy-provided back face (de-duplicated); ``None`` if none.
+
+        Used only when the decklist line names no explicit back. The file
+        is stored next to the front image under ``<front key>_back.png``.
+        """
+        key = f"{_image_key(name, art)}_back"
+        if key in unique:
+            return unique[key]
+        image_path = images_dir / f"{key}.png"
+        if not image_path.exists():
+            if not self.strategy.fetch_card_back_image(
+                name, str(image_path), art=art
+            ):
+                if image_path.exists():
+                    image_path.unlink(missing_ok=True)
+                return None
+            if not image_path.exists():
+                return None
+        unique[key] = image_path
+        return image_path
 
     def _expand_paired_slots(
         self,
@@ -665,3 +698,11 @@ def _sanitize_filename(name: str) -> str:
     cleaned = re.sub(r"[^\w\s()-]", "", name)
     cleaned = re.sub(r"\s+", "_", cleaned.strip())
     return cleaned or "card"
+
+
+def _image_key(name: str, art: str | None) -> str:
+    """De-duplication key (and file stem) for one card face image."""
+    key = _sanitize_filename(name)
+    if art:
+        key = f"{key}_{art}"
+    return key

@@ -74,8 +74,9 @@ and each side strips its own trailing `[art]` / `*F*` markers independently:
 4 Knight
 ```
 
-Lines without `/` stay single-sided (their back slot prints blank so every
-other card keeps its alignment).
+Lines without `/` stay single-sided — except MTG double-faced cards
+(transform, modal DFC...), whose back face is downloaded automatically, so
+`2 Jennifer Walters` alone prints both faces without naming the back.
 
 > 💡 `|` still works as a legacy alias for `/`. A double slash (`//`,
 > e.g. MTG split cards like `Fire // Ice`) is never a separator.
@@ -346,7 +347,13 @@ The MTG strategy resolves each card live through the **Scryfall API**
 Images are downloaded from the Scryfall image CDN in the highest-quality
 `png` version (744 x 1040, transparent rounded corners); the remaining
 versions (`large`, `normal`, `border_crop`, `small`) act as fallbacks.
-Double-faced cards use the front face (`card_faces[0].image_uris`).
+Double-faced cards (transform, modal DFC...) resolve both faces from a
+single decklist line: the front face (`card_faces[0].image_uris`) prints in
+`front_<deck>.pdf` and the back face (`card_faces[1].image_uris`) in
+`back_<deck>.pdf` — no `/ Back` needed (an explicit `/ Back` still wins).
+E.g. `2 Jennifer Walters` yields both `Jennifer Walters` and
+`The Sensational She-Hulk`. Split / flip / adventure cards expose a single
+image and have no automatic back.
 
 Every card is resolved live on each run. Scryfall's
 rate limits are honored: a 500 ms minimum interval between API requests and

@@ -49,3 +49,31 @@ class TCGStrategy(ABC):
             ``True`` if an image was successfully saved, otherwise ``False``.
         """
         raise NotImplementedError
+
+    def fetch_card_back_image(
+        self,
+        card_name: str,
+        output_path: str,
+        art: str | None = None,
+    ) -> bool:
+        """Fetch the automatic back-face image of a double-faced card.
+
+        Called by the exporter only when the decklist line names no
+        explicit back (no ``/ Back`` part): strategies whose cards can
+        have two physical faces (e.g. MTG transform / modal DFCs) may
+        resolve and save the back face here so a single decklist line
+        yields both sides. The default implementation reports no back
+        face (``False``) without touching ``output_path``.
+
+        Args:
+            card_name: Full name of the card (same value passed to
+                :meth:`fetch_card_image` for the front face).
+            output_path: Filesystem path where the back image must be saved.
+            art: Same art variant requested for the front face, so both
+                faces come from the same printing.
+
+        Returns:
+            ``True`` if a back-face image was successfully saved,
+            otherwise ``False`` (single-faced card or unresolvable back).
+        """
+        return False

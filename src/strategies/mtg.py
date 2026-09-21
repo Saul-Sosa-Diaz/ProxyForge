@@ -39,6 +39,12 @@ versions documented at https://scryfall.com/docs/api/images. By default the
 ``png`` version is used (744x1040, highest quality); the remaining versions
 (``large``, ``normal``, ``border_crop``, ``small``...) serve as fallbacks.
 
+Double-faced cards (transform, modal DFC...): ``fetch_card_image`` saves
+the front face (``card_faces[0]``) while ``fetch_card_back_image`` saves
+the back face (``card_faces[1]``), so a single decklist line prints both
+sides without naming the back explicitly. Split / flip / adventure cards
+expose a single top-level image and have no automatic back.
+
 Rate limits (https://scryfall.com/docs/api/rate-limits): the ``/cards/*``
 endpoints are limited to 2 requests/second, so a minimum interval is
 enforced between Scryfall API calls and HTTP 429 responses are honored via
@@ -98,6 +104,10 @@ class MTGStrategy(TCGStrategy):
         self.image_format = image_format
         self.min_request_interval = max(0.0, min_request_interval)
         self._last_request_at = 0.0
+        # Resolved Scryfall card objects, keyed by (normalized name,
+        # effective art): shared by the front and back fetches so a
+        # double-faced card costs no extra API calls for its back face.
+        self._card_cache: dict[tuple[str, str | None], dict[str, Any] | None] = {}
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -122,10 +132,67 @@ class MTGStrategy(TCGStrategy):
             return False
         return self._download_image(image_url, output_path)
 
+    def fetch_card_back_image(
+        self,
+        card_name: str,
+        output_path: str,
+        art: str | None = None,
+    ) -> bool:
+        """Save the back face of a double-faced card (same printing as front)."""
+        art = _effective_art(card_name, art)
+        card = self._resolve_card(card_name, art)
+        if card is None:
+            return False
+        back_url = self._extract_back_image_url(card)
+        if not back_url:
+            return False
+        faces = card.get("card_faces")
+        back_name = (
+            faces[1].get("name")
+            if isinstance(faces, list)
+            and len(faces) > 1
+            and isinstance(faces[1], dict)
+            else None
+        )
+        logger.info(
+            "Card '%s' is double-faced%s; downloading its back face.",
+            card_name,
+            f" (back: '{back_name}')" if back_name else "",
+        )
+        return self._download_image(back_url, output_path)
+
     # ------------------------------------------------------------------
     # Resolution helpers
     # ------------------------------------------------------------------
     def _resolve_image_url(self, card_name: str, art: str | None = None) -> str | None:
+        card = self._resolve_card(card_name, art)
+        if card is not None:
+            return self._extract_image_url(card)
+        # Moxfield fallback (its results carry no back-face imagery).
+        art_set, _, _, _ = _parse_mtg_art(art)
+        clean_name, name_set, _ = _parse_card_reference(card_name)
+        set_code = art_set if art_set is not None else name_set
+        logger.debug("Card '%s' not found on Scryfall; falling back to Moxfield", card_name)
+        return self._lookup_moxfield(card_name, set_code)
+
+    def _resolve_card(
+        self, card_name: str, art: str | None = None
+    ) -> dict[str, Any] | None:
+        """Resolve a Scryfall card object (cached per run).
+
+        ``art`` must already be the effective marker (see
+        :func:`_effective_art`). Returns ``None`` when Scryfall cannot
+        resolve the card (the caller then tries Moxfield, front only).
+        """
+        key = (_normalize(card_name), art)
+        if key not in self._card_cache:
+            self._card_cache[key] = self._lookup_scryfall_card(card_name, art)
+        return self._card_cache[key]
+
+    def _lookup_scryfall_card(
+        self, card_name: str, art: str | None = None
+    ) -> dict[str, Any] | None:
+        """Run the Scryfall resolution steps, returning the card object."""
         art_set, art_collector, art_variant, art_mode = _parse_mtg_art(art)
         clean_name, name_set, name_collector = _parse_card_reference(card_name)
         # An [art] set pins the printing: its collector (if any) wins and the
@@ -139,9 +206,9 @@ class MTGStrategy(TCGStrategy):
 
         # 1. Exact printing via the collector endpoint.
         if set_code is not None and collector_number is not None:
-            url = self._lookup_scryfall_collector(set_code, collector_number, clean_name)
-            if url:
-                return url
+            card = self._lookup_scryfall_collector(set_code, collector_number, clean_name)
+            if card:
+                return card
             logger.debug(
                 "Card '%s' not found at %s:%s; falling back to name lookup",
                 card_name,
@@ -151,35 +218,32 @@ class MTGStrategy(TCGStrategy):
 
         # 2. Variant / base requests need the full prints list.
         if art_variant is not None or art_mode == "base":
-            url = self._lookup_scryfall_prints(
+            card = self._lookup_scryfall_prints(
                 clean_name, set_code, art_variant, art_mode, card_name
             )
-            if url:
-                return url
+            if card:
+                return card
             logger.info(
                 "Card '%s' has no matching '%s' printing; using default art",
                 card_name,
                 art_variant or art_mode,
             )
 
-        url = self._lookup_scryfall_named(clean_name, set_code)
-        if not url:
+        card = self._lookup_scryfall_named(clean_name, set_code)
+        if not card:
             logger.debug(
                 "Card '%s' not found via /cards/named; falling back to /cards/search",
                 card_name,
             )
-            url = self._lookup_scryfall_search(clean_name)
-        if not url:
-            logger.debug(
-                "Card '%s' not found on Scryfall; falling back to Moxfield", card_name
-            )
-            url = self._lookup_moxfield(card_name, set_code)
-        return url
+            card = self._lookup_scryfall_search(clean_name)
+        return card
 
     # ------------------------------------------------------------------
     # Source 1: Scryfall /cards/named (exact + fuzzy, optional set filter)
     # ------------------------------------------------------------------
-    def _lookup_scryfall_named(self, card_name: str, set_code: str | None) -> str | None:
+    def _lookup_scryfall_named(
+        self, card_name: str, set_code: str | None
+    ) -> dict[str, Any] | None:
         attempts: list[dict[str, str]] = []
         if set_code:
             attempts.append({"exact": card_name, "set": set_code})
@@ -191,7 +255,7 @@ class MTGStrategy(TCGStrategy):
             logger.debug("Scryfall named lookup for '%s' (%s)", card_name, match_type)
             card = self._api_get(self.NAMED_ENDPOINT, params)
             if card:
-                return self._extract_image_url(card)
+                return card
         return None
 
     # ------------------------------------------------------------------
@@ -199,7 +263,7 @@ class MTGStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     def _lookup_scryfall_collector(
         self, set_code: str, collector_number: str, expected_name: str | None = None
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         """Fetch an exact printing via ``GET /cards/<set>/<collector>``.
 
         The endpoint returns whatever lives at that slot, so when
@@ -226,7 +290,7 @@ class MTGStrategy(TCGStrategy):
                 expected_name,
             )
             return None
-        return self._extract_image_url(card)
+        return card
 
     # ------------------------------------------------------------------
     # Source 1b: Scryfall prints search (variant / base art selection)
@@ -238,7 +302,7 @@ class MTGStrategy(TCGStrategy):
         variant: str | None,
         mode: str | None,
         original_name: str,
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         """Resolve a variant/base request via ``/cards/search`` ``unique:prints``.
 
         All printings of ``card_name`` are fetched (newest first) and filtered
@@ -281,7 +345,7 @@ class MTGStrategy(TCGStrategy):
             picked.get("collector_number"),
             variant or mode,
         )
-        return self._extract_image_url(picked)
+        return picked
 
     def _search_all_prints(self, query: str) -> list[dict[str, Any]]:
         """Fetch every page of a ``unique:prints`` search (newest first)."""
@@ -323,14 +387,14 @@ class MTGStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     # Source 2: Scryfall /cards/search fallback
     # ------------------------------------------------------------------
-    def _lookup_scryfall_search(self, card_name: str) -> str | None:
+    def _lookup_scryfall_search(self, card_name: str) -> dict[str, Any] | None:
         card = self._api_get(self.SEARCH_ENDPOINT, {"q": card_name})
         if not card:
             return None
         data = card.get("data")
         if not isinstance(data, list) or not data or not isinstance(data[0], dict):
             return None
-        return self._extract_image_url(data[0])
+        return data[0]
 
     # ------------------------------------------------------------------
     # Source 3: Moxfield fallback
@@ -457,6 +521,32 @@ class MTGStrategy(TCGStrategy):
             faces = card.get("card_faces")
             if isinstance(faces, list) and faces and isinstance(faces[0], dict):
                 image_uris = faces[0].get("image_uris")
+        if not isinstance(image_uris, dict):
+            return None
+        for fmt in self._image_format_candidates():
+            url = image_uris.get(fmt)
+            if isinstance(url, str) and url:
+                return url
+        return None
+
+    def _extract_back_image_url(self, card: dict[str, Any]) -> str | None:
+        """Extract the back-face image URL from a Scryfall Card object.
+
+        Only faces carrying their own imagery count (transform, modal
+        DFC... via ``card_faces[1].image_uris``). Split / flip / adventure
+        cards expose a single top-level image — their faces have no
+        ``image_uris`` — so they correctly yield ``None`` here.
+        """
+        if card.get("image_status") == "missing":
+            return None
+        faces = card.get("card_faces")
+        if (
+            not isinstance(faces, list)
+            or len(faces) < 2
+            or not isinstance(faces[1], dict)
+        ):
+            return None
+        image_uris = faces[1].get("image_uris")
         if not isinstance(image_uris, dict):
             return None
         for fmt in self._image_format_candidates():
