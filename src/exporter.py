@@ -94,17 +94,18 @@ class Exporter:
         """Download images and emit one PDF per finish (regular / foil).
 
         Foil entries (``DeckCard.foil``) are rendered into
-        ``<deck_name>_printable_foil.pdf`` so they can be printed on
+        ``foil_<deck_name>.pdf`` so they can be printed on
         separate (e.g. holographic) stock; the remaining cards go into
-        ``<deck_name>_printable.pdf``. A PDF is only built for a finish
+        ``<deck_name>.pdf``. A PDF is only built for a finish
         that has at least one card.
 
-        Single-sided cards go into ``<deck_name>_printable.pdf`` (or
-        ``<deck_name>_printable_foil.pdf`` for foil fronts). Double-sided
+        Single-sided cards go into ``<deck_name>.pdf`` (or
+        ``foil_<deck_name>.pdf`` for foil fronts). Double-sided
         entries (``DeckCard.back_name``) are separated into their own
-        ``<deck_name>_dual_printable.pdf`` (fronts, deck order) plus
-        ``<deck_name>_dual_printable_back.pdf`` (backs, deck order;
-        ``_dual_printable_foil*.pdf`` for foil fronts) so they print on
+        ``front_<deck_name>.pdf`` (fronts, deck order) plus
+        ``back_<deck_name>.pdf`` (backs, deck order;
+        ``foil_front_<deck_name>.pdf`` / ``foil_back_<deck_name>.pdf``
+        for foil fronts) so they print on
         their own: same page count front/back (page *N* of the back
         belongs behind page *N* of the front), no blank pages except
         failed back downloads. The back grid coincides exactly with the
@@ -128,7 +129,7 @@ class Exporter:
             reg_singles = [(f, q) for f, b, q in regular if b is None]
             reg_duals = [(f, b, q) for f, b, q in regular if b is not None]
             if reg_singles:
-                front_pdf_path = deck_dir / f"{deck_name}_printable.pdf"
+                front_pdf_path = deck_dir / f"{deck_name}.pdf"
                 self._build_pdf(reg_singles, front_pdf_path)
                 logger.info("PDF written to %s", front_pdf_path)
                 pdf_path = pdf_path or front_pdf_path
@@ -145,7 +146,7 @@ class Exporter:
             foil_singles = [(f, q) for f, b, q in foils if b is None]
             foil_duals = [(f, b, q) for f, b, q in foils if b is not None]
             if foil_singles:
-                foil_pdf_path = deck_dir / f"{deck_name}_printable_foil.pdf"
+                foil_pdf_path = deck_dir / f"foil_{deck_name}.pdf"
                 self._build_pdf(foil_singles, foil_pdf_path)
                 logger.info("Foil PDF written to %s", foil_pdf_path)
                 pdf_path = pdf_path or foil_pdf_path
@@ -184,7 +185,8 @@ class Exporter:
         if not duals:
             return None
         tag = "Foil dual-sided" if foil else "Dual-sided"
-        infix = "_dual_printable_foil" if foil else "_dual_printable"
+        prefix = "foil_front_" if foil else "front_"
+        back_prefix = "foil_back_" if foil else "back_"
         front_flat, back_flat = self._expand_paired_slots(duals)
         front_flat, back_flat = self._drop_missing_fronts(front_flat, back_flat)
         if not front_flat:
@@ -194,11 +196,11 @@ class Exporter:
                 deck_name,
             )
             return None
-        dual_front_pdf = deck_dir / f"{deck_name}{infix}.pdf"
+        dual_front_pdf = deck_dir / f"{prefix}{deck_name}.pdf"
         self._build_front_pages(front_flat, dual_front_pdf)
         logger.info("%s front PDF written to %s", tag, dual_front_pdf)
         if any(b is not None for b in back_flat):
-            dual_back_pdf = deck_dir / f"{deck_name}{infix}_back.pdf"
+            dual_back_pdf = deck_dir / f"{back_prefix}{deck_name}.pdf"
             self._build_back_pages(back_flat, dual_back_pdf)
             logger.info("%s back PDF written to %s", tag, dual_back_pdf)
         return dual_front_pdf
