@@ -26,14 +26,15 @@ MM_PER_INCH = 25.4
 CARD_WIDTH_PX = round(CARD_WIDTH_MM * PRINT_DPI / MM_PER_INCH)  # 1984
 CARD_HEIGHT_PX = round(CARD_HEIGHT_MM * PRINT_DPI / MM_PER_INCH)  # 2772
 
-# Professional cut geometry: gutter between cards, optional bleed and
+# Professional cut geometry: gutter between cards, mirrored-edge bleed and
 # trim (crop) marks placed in the outer margins of the sheet.
-# Bleed is DISABLED (0.0): any artwork drawn past the trim line moves the
-# visible card edge beyond the 63x88 mm boundary, so the crop marks appear
-# misaligned with the card and the card looks enlarged. With no bleed the
-# marks coincide exactly with the visible card edges and the full 3 mm
-# gutter stays white.
-BLEED_MM = 0.0  # mirrored-edge overrun past the card edge (0 = disabled)
+# Bleed is 1.0 mm: each card is still rendered at exactly 63x88 mm, plus a
+# 1 mm mirrored copy of its outer edge extending into the gutter. The trim
+# line (where the crop marks point) stays exactly on the visible card edge,
+# so a perfect cut yields 63x88 mm and a ~1 mm off cut still hits artwork
+# instead of leaving a white sliver. With a 3 mm gutter, 1 mm of clean
+# white remains between adjacent bleeds so the cut line stays visible.
+BLEED_MM = 1.0  # mirrored-edge overrun past the card edge
 CROP_MARK_LENGTH_MM = 3.0  # tick length, pointing outward from the block
 CROP_MARK_THICKNESS_MM = 0.12  # thin line so any kerf drift leaves no visible sliver
 CROP_MARK_COLOR = (0, 0, 0)
@@ -59,9 +60,10 @@ class Exporter:
     gutter and rendered at exactly 63x88 mm (never rescaled beyond that
     size). Crop marks in the outer page margins point exactly at the visible
     card edges, so a cut aligned with a mark trims the card to precisely
-    63x88 mm. An optional mirrored-edge bleed (``BLEED_MM`` > 0) can extend
-    the artwork into the gutter, but it is disabled by default because it
-    shifts the visible edge past the trim line.
+    63x88 mm. A mirrored-edge bleed (``BLEED_MM`` = 1.0 mm) extends a
+    mirrored copy of the artwork into the gutter; the trim line stays on
+    the visible card edge, so mis-cuts up to ~1 mm still hit artwork
+    instead of white paper.
     """
 
     def __init__(

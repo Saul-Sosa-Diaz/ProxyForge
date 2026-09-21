@@ -207,8 +207,11 @@ fronts pair with the regular back PDF and foil fronts with the foil back
 PDF.
 
 The PDFs arrange cards into a multi-page grid on A4 paper. Each card slot is
-exactly **63 x 88 mm**, separated by a 3 mm gutter with 1 mm artwork bleed into it,
-plus crop marks in the outer margins for clean physical trimming after printing.
+exactly **63 x 88 mm**, separated by a 3 mm gutter with a fixed 1 mm
+mirrored-edge bleed into it (a mirrored copy of each card's outer edge, so
+cuts wandering up to ~1 mm still hit artwork instead of white paper while a
+perfect cut still yields exactly 63 x 88 mm), plus crop marks in the outer
+margins for clean physical trimming after printing.
 
 ### 🖨️ Printing double-sided cards
 
@@ -416,6 +419,8 @@ python src/main.py --input input/my_deck.txt --output output --tcg local \
 | Card pixels (at 800 DPI) | ~1984 x 2772 px |
 | Page size | A4 (210 x 297 mm) |
 | Grid | 3 x 3 (9 cards per page) |
+| Gutter | 3 mm |
+| Bleed | 1 mm fixed (mirrored edge) |
 
 ---
 
