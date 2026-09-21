@@ -99,19 +99,19 @@ class Exporter:
         ``<deck_name>_printable.pdf``. A PDF is only built for a finish
         that has at least one card.
 
-        Double-sided entries (``DeckCard.back_name``) additionally emit a
-        mirrored ``<deck_name>_printable_back.pdf`` (and
-        ``<deck_name>_printable_foil_back.pdf`` for foil fronts) whose grid
-        coincides exactly with the front PDF — same 63x88 mm slots, same
-        gutter, same margins, same upright orientation — with columns
-        mirrored so manual duplex ("flip on long edge", print at 100 %)
-        aligns each back with its front. Within each finish, double-sided
-        cards render first so the back PDF never opens with blank pages;
-        single-sided cards keep their relative order after them and leave
-        a blank back slot behind their front. Trailing fully-blank back
-        pages are dropped, so the back PDF may be shorter than the front
-        PDF (page *N* of the back still belongs behind page *N* of the
-        front). Grouping always follows the front-face foil flag.
+        Single-sided cards go into ``<deck_name>_printable.pdf`` (or
+        ``<deck_name>_printable_foil.pdf`` for foil fronts). Double-sided
+        entries (``DeckCard.back_name``) are separated into their own
+        ``<deck_name>_dual_printable.pdf`` (fronts, deck order) plus
+        ``<deck_name>_dual_printable_back.pdf`` (backs, deck order;
+        ``_dual_printable_foil*.pdf`` for foil fronts) so they print on
+        their own: same page count front/back (page *N* of the back
+        belongs behind page *N* of the front), no blank pages except
+        failed back downloads. The back grid coincides exactly with the
+        front grid — same 63x88 mm slots, same gutter, same margins, same
+        upright orientation — with columns mirrored so manual duplex
+        ("flip on long edge", print at 100 %) aligns each back with its
+        front. Grouping always follows the front-face foil flag.
         """
         deck_dir = self.output_base / deck_name
         images_dir = deck_dir / "images"
@@ -125,55 +125,83 @@ class Exporter:
 
         pdf_path: Path | None = None
         if regular:
-            pdf_path = deck_dir / f"{deck_name}_printable.pdf"
-            front_flat, back_flat = self._expand_paired_slots(regular)
-            front_flat, back_flat = self._drop_missing_fronts(
-                front_flat, back_flat
-            )
-            front_flat, back_flat = self._backs_first(front_flat, back_flat)
-            if not front_flat:
-                raise RuntimeError("No images available to build the PDF.")
-            self._build_front_pages(front_flat, pdf_path)
-            logger.info("PDF written to %s", pdf_path)
-            if any(b is not None for b in back_flat):
-                back_pdf_path = deck_dir / f"{deck_name}_printable_back.pdf"
-                self._build_back_pages(back_flat, back_pdf_path)
-                logger.info("Back PDF written to %s", back_pdf_path)
+            reg_singles = [(f, q) for f, b, q in regular if b is None]
+            reg_duals = [(f, b, q) for f, b, q in regular if b is not None]
+            if reg_singles:
+                front_pdf_path = deck_dir / f"{deck_name}_printable.pdf"
+                self._build_pdf(reg_singles, front_pdf_path)
+                logger.info("PDF written to %s", front_pdf_path)
+                pdf_path = pdf_path or front_pdf_path
             else:
                 logger.debug(
-                    "Deck '%s' has no double-sided regular cards; no back PDF generated.",
+                    "Deck '%s' has no single-sided regular cards; no regular PDF generated.",
                     deck_name,
                 )
+            dual_pdf_path = self._emit_dual_pdfs(
+                deck_dir, deck_name, reg_duals, foil=False
+            )
+            pdf_path = pdf_path or dual_pdf_path
         if foils:
-            foil_pdf_path = deck_dir / f"{deck_name}_printable_foil.pdf"
-            front_flat_f, back_flat_f = self._expand_paired_slots(foils)
-            front_flat_f, back_flat_f = self._drop_missing_fronts(
-                front_flat_f, back_flat_f
-            )
-            front_flat_f, back_flat_f = self._backs_first(
-                front_flat_f, back_flat_f
-            )
-            if front_flat_f:
-                self._build_front_pages(front_flat_f, foil_pdf_path)
+            foil_singles = [(f, q) for f, b, q in foils if b is None]
+            foil_duals = [(f, b, q) for f, b, q in foils if b is not None]
+            if foil_singles:
+                foil_pdf_path = deck_dir / f"{deck_name}_printable_foil.pdf"
+                self._build_pdf(foil_singles, foil_pdf_path)
                 logger.info("Foil PDF written to %s", foil_pdf_path)
                 pdf_path = pdf_path or foil_pdf_path
-                if any(b is not None for b in back_flat_f):
-                    foil_back_pdf_path = (
-                        deck_dir / f"{deck_name}_printable_foil_back.pdf"
-                    )
-                    self._build_back_pages(back_flat_f, foil_back_pdf_path)
-                    logger.info("Foil back PDF written to %s", foil_back_pdf_path)
             else:
-                logger.warning(
-                    "Foil entries for deck '%s' have no downloadable images; skipping foil PDFs.",
+                logger.debug(
+                    "Deck '%s' has no single-sided foil cards; no foil PDF generated.",
                     deck_name,
                 )
+            dual_foil_pdf_path = self._emit_dual_pdfs(
+                deck_dir, deck_name, foil_duals, foil=True
+            )
+            pdf_path = pdf_path or dual_foil_pdf_path
         else:
             logger.debug(
                 "Deck '%s' has no foil cards; no foil PDF generated.", deck_name
             )
-        assert pdf_path is not None
+        if pdf_path is None:
+            raise RuntimeError("No images available to build the PDF.")
         return pdf_path
+
+    def _emit_dual_pdfs(
+        self,
+        deck_dir: Path,
+        deck_name: str,
+        duals: list[tuple[Path, Path | None, int]],
+        foil: bool,
+    ) -> Path | None:
+        """Emit the separated double-sided PDFs for one finish.
+
+        Returns the dual front PDF path, or ``None`` when there is
+        nothing to render. ``duals`` holds ``(front, back_or_None, qty)``
+        pairs in deck order; fronts keep that order and backs mirror it,
+        so both PDFs share pagination 1:1 with no blank pages (a failed
+        back download degrades to a blank slot).
+        """
+        if not duals:
+            return None
+        tag = "Foil dual-sided" if foil else "Dual-sided"
+        infix = "_dual_printable_foil" if foil else "_dual_printable"
+        front_flat, back_flat = self._expand_paired_slots(duals)
+        front_flat, back_flat = self._drop_missing_fronts(front_flat, back_flat)
+        if not front_flat:
+            logger.warning(
+                "%s entries for deck '%s' have no downloadable images; skipping dual PDFs.",
+                tag,
+                deck_name,
+            )
+            return None
+        dual_front_pdf = deck_dir / f"{deck_name}{infix}.pdf"
+        self._build_front_pages(front_flat, dual_front_pdf)
+        logger.info("%s front PDF written to %s", tag, dual_front_pdf)
+        if any(b is not None for b in back_flat):
+            dual_back_pdf = deck_dir / f"{deck_name}{infix}_back.pdf"
+            self._build_back_pages(back_flat, dual_back_pdf)
+            logger.info("%s back PDF written to %s", tag, dual_back_pdf)
+        return dual_front_pdf
 
     # ------------------------------------------------------------------
     # De-duplicated downloads
@@ -284,23 +312,6 @@ class Exporter:
             else:
                 kept_back.append(back_path)
         return kept_front, kept_back
-
-    @staticmethod
-    def _backs_first(
-        front_slots: list[Path],
-        back_slots: list[Path | None],
-    ) -> tuple[list[Path], list[Path | None]]:
-        """Stable reorder: double-sided cards first, single-sided last.
-
-        Keeps front/back pairs aligned and preserves the relative order
-        inside each group, so the back PDF starts with backs from page 1
-        instead of opening with blank pages. Decks without backs keep
-        their exact input order.
-        """
-        ordered = sorted(
-            zip(front_slots, back_slots), key=lambda pair: pair[1] is None
-        )
-        return [f for f, _ in ordered], [b for _, b in ordered]
 
     # ------------------------------------------------------------------
     # PDF assembly
@@ -435,8 +446,8 @@ class Exporter:
         flipping the stack like a book (long edge) and printing the backs
         at 100 % puts every back exactly behind its front. Crop marks are
         identical to the front pages. Trailing fully-blank pages are
-        dropped (never rendered) so the back PDF contains no blank pages;
-        middle pages keep their blanks to preserve page-to-page alignment.
+        dropped (never rendered); middle pages keep their blanks to
+        preserve page-to-page alignment.
         """
         if not back_slots or not any(b is not None for b in back_slots):
             raise RuntimeError("No back images available to build the back PDF.")

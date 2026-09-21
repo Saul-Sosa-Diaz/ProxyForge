@@ -181,11 +181,13 @@ For a deck file named `my_awesome_deck.txt`, the application produces:
 
 ```text
 output/my_awesome_deck/
-├── images/                              # uniquely downloaded card images
-├── my_awesome_deck_printable.pdf        # regular cards (fronts)
-├── my_awesome_deck_printable_back.pdf   # regular backs (when any "/" present)
-├── my_awesome_deck_printable_foil.pdf   # foil entries only (when present)
-└── my_awesome_deck_printable_foil_back.pdf  # foil backs (when any foil "/" present)
+├── images/                                   # uniquely downloaded card images
+├── my_awesome_deck_printable.pdf             # single-sided regular cards
+├── my_awesome_deck_printable_foil.pdf        # single-sided foil entries (when present)
+├── my_awesome_deck_dual_printable.pdf        # double-sided fronts (when any "/" present)
+├── my_awesome_deck_dual_printable_back.pdf   # double-sided backs
+├── my_awesome_deck_dual_printable_foil.pdf      # double-sided foil fronts (when present)
+└── my_awesome_deck_dual_printable_foil_back.pdf # double-sided foil backs
 ```
 
 Decklist entries marked as foil/premium with a trailing `*F*` (Manabox) or
@@ -194,17 +196,17 @@ be printed on separate (e.g. holographic) paper stock; the marker is
 stripped from the card name before fetching. Decks without foil entries
 only produce the regular PDF.
 
-Double-sided entries (`/ Back Name`) additionally emit a `*_back.pdf` whose
-grid coincides exactly with the front PDF — same 63 x 88 mm slots, same
-gutter, same margins, same upright orientation — with columns mirrored, so
-each back lands exactly behind its front. Double-sided cards render first
-(within each finish), so the back PDF starts printing backs from page 1 and
-contains no blank pages; single-sided cards follow in file order and leave a
-blank back slot behind their front. The back PDF may therefore be shorter
-than the front PDF — page *N* of the back still belongs behind page *N* of
-the front. Grouping always follows the front-face foil flag, so regular
-fronts pair with the regular back PDF and foil fronts with the foil back
-PDF.
+Double-sided entries (`/ Back Name`) are separated into their own pair of
+PDFs — `*_dual_printable.pdf` (fronts, deck order) plus
+`*_dual_printable_back.pdf` (backs, deck order) — so they print on their
+own, apart from the single-sided cards. Both share the same page count
+(page *N* of the back belongs behind page *N* of the front) with no blank
+pages, and the back grid coincides exactly with the front grid — same
+63 x 88 mm slots, same gutter, same margins, same upright orientation —
+with columns mirrored, so each back lands exactly behind its front.
+Grouping always follows the front-face foil flag: regular doubles pair
+`dual_printable` ↔ `dual_printable_back`, foil doubles pair
+`dual_printable_foil` ↔ `dual_printable_foil_back`.
 
 The PDFs arrange cards into a multi-page grid on A4 paper. Each card slot is
 exactly **63 x 88 mm**, separated by a 3 mm gutter with a fixed 1 mm
@@ -213,17 +215,20 @@ cuts wandering up to ~1 mm still hit artwork instead of white paper while a
 perfect cut still yields exactly 63 x 88 mm), plus crop marks in the outer
 margins for clean physical trimming after printing.
 
+### 🖨️ Printing single-sided cards
+
+Print `*_printable.pdf` single-sided at **100 % / actual size** (no
+fit-to-page), and separately `*_printable_foil.pdf` on holographic stock.
+
 ### 🖨️ Printing double-sided cards
 
-1. Print `*_printable.pdf` single-sided at **100 % / actual size** (no
-   fit-to-page).
-2. Flip the stack **like a book (long edge, top stays on top)** and reinsert
-   it.
-3. Print `*_printable_back.pdf` single-sided at 100 % on the reverse.
-   Page *N* of the back file belongs behind page *N* of the front file, in
-   the same upright orientation (the back file has no blank pages and may
-   have fewer pages — the extra front pages at the end are single-sided).
-   Do the same pairing for the `*_foil*.pdf` files on holographic stock.
+1. Print `*_dual_printable.pdf` single-sided at **100 % / actual size**.
+2. Flip the whole stack **like a book (long edge, top stays on top)** and
+   reinsert it.
+3. Print `*_dual_printable_back.pdf` single-sided at 100 % on the reverse.
+   Both files have the same pages in the same upright orientation: page *N*
+   of the back lands behind page *N* of the front. Do the same pairing for
+   the `*_dual_printable_foil*.pdf` files on holographic stock.
 
 ---
 
