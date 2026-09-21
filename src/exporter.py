@@ -96,27 +96,76 @@ class Exporter:
         separate (e.g. holographic) stock; the remaining cards go into
         ``<deck_name>_printable.pdf``. A PDF is only built for a finish
         that has at least one card.
+
+        Double-sided entries (``DeckCard.back_name``) additionally emit a
+        mirrored ``<deck_name>_printable_back.pdf`` (and
+        ``<deck_name>_printable_foil_back.pdf`` for foil fronts) whose grid
+        coincides exactly with the front PDF — same 63x88 mm slots, same
+        gutter, same margins, same upright orientation — with columns
+        mirrored so manual duplex ("flip on long edge", print at 100 %)
+        aligns each back with its front. Within each finish, double-sided
+        cards render first so the back PDF never opens with blank pages;
+        single-sided cards keep their relative order after them and leave
+        a blank back slot behind their front. Trailing fully-blank back
+        pages are dropped, so the back PDF may be shorter than the front
+        PDF (page *N* of the back still belongs behind page *N* of the
+        front). Grouping always follows the front-face foil flag.
         """
         deck_dir = self.output_base / deck_name
         images_dir = deck_dir / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
 
         expanded = self._download_unique_cards(cards, images_dir)
-        regular = [(path, qty) for path, qty, foil in expanded if not foil]
-        foils = [(path, qty) for path, qty, foil in expanded if foil]
+        regular = [(f, b, qty) for f, b, qty, foil in expanded if not foil]
+        foils = [(f, b, qty) for f, b, qty, foil in expanded if foil]
         if not regular and not foils:
             raise RuntimeError("No images available to build the PDF.")
 
         pdf_path: Path | None = None
         if regular:
             pdf_path = deck_dir / f"{deck_name}_printable.pdf"
-            self._build_pdf(regular, pdf_path)
+            front_flat, back_flat = self._expand_paired_slots(regular)
+            front_flat, back_flat = self._drop_missing_fronts(
+                front_flat, back_flat
+            )
+            front_flat, back_flat = self._backs_first(front_flat, back_flat)
+            if not front_flat:
+                raise RuntimeError("No images available to build the PDF.")
+            self._build_front_pages(front_flat, pdf_path)
             logger.info("PDF written to %s", pdf_path)
+            if any(b is not None for b in back_flat):
+                back_pdf_path = deck_dir / f"{deck_name}_printable_back.pdf"
+                self._build_back_pages(back_flat, back_pdf_path)
+                logger.info("Back PDF written to %s", back_pdf_path)
+            else:
+                logger.debug(
+                    "Deck '%s' has no double-sided regular cards; no back PDF generated.",
+                    deck_name,
+                )
         if foils:
             foil_pdf_path = deck_dir / f"{deck_name}_printable_foil.pdf"
-            self._build_pdf(foils, foil_pdf_path)
-            logger.info("Foil PDF written to %s", foil_pdf_path)
-            pdf_path = pdf_path or foil_pdf_path
+            front_flat_f, back_flat_f = self._expand_paired_slots(foils)
+            front_flat_f, back_flat_f = self._drop_missing_fronts(
+                front_flat_f, back_flat_f
+            )
+            front_flat_f, back_flat_f = self._backs_first(
+                front_flat_f, back_flat_f
+            )
+            if front_flat_f:
+                self._build_front_pages(front_flat_f, foil_pdf_path)
+                logger.info("Foil PDF written to %s", foil_pdf_path)
+                pdf_path = pdf_path or foil_pdf_path
+                if any(b is not None for b in back_flat_f):
+                    foil_back_pdf_path = (
+                        deck_dir / f"{deck_name}_printable_foil_back.pdf"
+                    )
+                    self._build_back_pages(back_flat_f, foil_back_pdf_path)
+                    logger.info("Foil back PDF written to %s", foil_back_pdf_path)
+            else:
+                logger.warning(
+                    "Foil entries for deck '%s' have no downloadable images; skipping foil PDFs.",
+                    deck_name,
+                )
         else:
             logger.debug(
                 "Deck '%s' has no foil cards; no foil PDF generated.", deck_name
@@ -127,62 +176,143 @@ class Exporter:
     # ------------------------------------------------------------------
     # De-duplicated downloads
     # ------------------------------------------------------------------
+    def _fetch_single_image(
+        self,
+        name: str,
+        art: str | None,
+        images_dir: Path,
+        unique: dict[str, Path],
+    ) -> Path | None:
+        """Fetch one face image (de-duplicated); ``None`` on failure."""
+        key = _sanitize_filename(name)
+        if art:
+            key = f"{key}_{art}"
+        if key in unique:
+            return unique[key]
+        image_path = images_dir / f"{key}.png"
+        if not image_path.exists():
+            logger.info("Fetching image for '%s'...", name)
+            ok = self.strategy.fetch_card_image(name, str(image_path), art=art)
+            if not ok:
+                logger.warning("Failed to fetch image for '%s'", name)
+                if image_path.exists():
+                    image_path.unlink(missing_ok=True)
+                return None
+        unique[key] = image_path
+        return image_path
+
     def _download_unique_cards(
         self,
         cards: list[DeckCard],
         images_dir: Path,
-    ) -> list[tuple[Path, int, bool]]:
+    ) -> list[tuple[Path, Path | None, int, bool]]:
         """Download each unique card once and expand quantities after the fact.
 
-        Returns a list of ``(image_path, quantity, foil)`` tuples in deck
-        order. The same image is shared by entries that only differ in
-        finish (foil vs regular); entries with a different ``[art]`` marker
-        get their own image file.
+        Returns a list of ``(front_path, back_path_or_None, quantity,
+        front_foil)`` tuples in deck order. The same image file is shared
+        by entries that only differ in finish (foil vs regular) or by a
+        front and a back requesting the same name + ``[art]``; entries with
+        a different ``[art]`` marker get their own image file. A failed
+        front download skips the whole entry (its back has no slot to
+        align to); a failed back download degrades to a blank back slot.
         """
         unique: dict[str, Path] = {}
-        expanded: list[tuple[Path, int, bool]] = []
+        expanded: list[tuple[Path, Path | None, int, bool]] = []
 
         for card in cards:
-            key = _sanitize_filename(card.name)
-            if card.art:
-                key = f"{key}_{card.art}"
-            if key in unique:
-                image_path = unique[key]
-            else:
-                image_path = images_dir / f"{key}.png"
-                if not image_path.exists():
-                    logger.info("Fetching image for '%s'...", card.name)
-                    ok = self.strategy.fetch_card_image(
-                        card.name, str(image_path), art=card.art
+            front_path = self._fetch_single_image(
+                card.name, card.art, images_dir, unique
+            )
+            if front_path is None:
+                continue
+            back_path: Path | None = None
+            if card.back_name:
+                fetched_back = self._fetch_single_image(
+                    card.back_name, card.back_art, images_dir, unique
+                )
+                if fetched_back is None:
+                    logger.warning(
+                        "Failed to fetch back image for '%s' (front '%s'); "
+                        "leaving its back slot blank.",
+                        card.back_name,
+                        card.name,
                     )
-                    if not ok:
-                        logger.warning("Failed to fetch image for '%s'", card.name)
-                        if image_path.exists():
-                            image_path.unlink(missing_ok=True)
-                        continue
-                unique[key] = image_path
-            expanded.append((image_path, card.quantity, card.foil))
+                    back_path = None
+                else:
+                    back_path = fetched_back
+            expanded.append((front_path, back_path, card.quantity, card.foil))
 
         return expanded
+
+    def _expand_paired_slots(
+        self,
+        paired: list[tuple[Path, Path | None, int]],
+    ) -> tuple[list[Path], list[Path | None]]:
+        """Expand ``(front, back_or_None, qty)`` into parallel flat slot lists.
+
+        Both lists share the same order and length so index ``i`` of the
+        back list is the reverse face of index ``i`` of the front list
+        (``None`` = single-sided, prints blank).
+        """
+        front_slots: list[Path] = []
+        back_slots: list[Path | None] = []
+        for front_path, back_path, quantity in paired:
+            front_slots.extend([front_path] * quantity)
+            back_slots.extend([back_path] * quantity)
+        return front_slots, back_slots
+
+    def _drop_missing_fronts(
+        self,
+        front_slots: list[Path],
+        back_slots: list[Path | None],
+    ) -> tuple[list[Path], list[Path | None]]:
+        """Drop indices whose front image is missing, keeping pairs aligned.
+
+        Missing/failed back images become ``None`` (blank) instead of
+        shifting pagination.
+        """
+        kept_front: list[Path] = []
+        kept_back: list[Path | None] = []
+        for front_path, back_path in zip(front_slots, back_slots):
+            if not front_path.exists():
+                continue
+            kept_front.append(front_path)
+            if back_path is None or not back_path.exists():
+                kept_back.append(None)
+            else:
+                kept_back.append(back_path)
+        return kept_front, kept_back
+
+    @staticmethod
+    def _backs_first(
+        front_slots: list[Path],
+        back_slots: list[Path | None],
+    ) -> tuple[list[Path], list[Path | None]]:
+        """Stable reorder: double-sided cards first, single-sided last.
+
+        Keeps front/back pairs aligned and preserves the relative order
+        inside each group, so the back PDF starts with backs from page 1
+        instead of opening with blank pages. Decks without backs keep
+        their exact input order.
+        """
+        ordered = sorted(
+            zip(front_slots, back_slots), key=lambda pair: pair[1] is None
+        )
+        return [f for f, _ in ordered], [b for _, b in ordered]
 
     # ------------------------------------------------------------------
     # PDF assembly
     # ------------------------------------------------------------------
-    def _build_pdf(
-        self,
-        expanded: list[tuple[Path, int]],
-        pdf_path: Path,
-    ) -> None:
-        slots = self._flatten_slots(expanded)
-        if not slots:
-            raise RuntimeError("No images available to build the PDF.")
+    def _page_geometry(self) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
+        """Compute shared raster geometry so front/back PDFs coincide exactly.
 
+        Returns ``(cols, rows, per_page, page_w_px, page_h_px, card_w_px,
+        card_h_px, gap_px, bleed_px, start_x, start_y)``. Both front and
+        back builders must use this single source so every 63x88 mm slot,
+        gutter, margin and crop mark lands on the same physical coordinates.
+        """
         cols, rows = self._compute_grid()
         per_page = cols * rows
-        valid_slots = [s for s in slots if s.exists()]
-        if not valid_slots:
-            raise RuntimeError("No downloaded images exist on disk.")
-
         page_w_px = round(self._mm_to_px(self.page_width_mm))
         page_h_px = round(self._mm_to_px(self.page_height_mm))
         card_w_px = round(self._mm_to_px(CARD_WIDTH_MM))
@@ -200,10 +330,70 @@ class Exporter:
         block_h_px = rows * card_h_px + (rows - 1) * gap_px
         start_x = round((page_w_px - block_w_px) / 2)
         start_y = round((page_h_px - block_h_px) / 2)
+        return (
+            cols,
+            rows,
+            per_page,
+            page_w_px,
+            page_h_px,
+            card_w_px,
+            card_h_px,
+            gap_px,
+            bleed_px,
+            start_x,
+            start_y,
+        )
+
+    def _save_pages(self, page_images: list[Image.Image], pdf_path: Path) -> None:
+        if not page_images:
+            raise RuntimeError("No images available to build the PDF.")
+        page_images[0].save(
+            str(pdf_path),
+            "PDF",
+            resolution=self.target_dpi,
+            save_all=True,
+            append_images=page_images[1:],
+        )
+
+    def _build_pdf(
+        self,
+        expanded: list[tuple[Path, int]],
+        pdf_path: Path,
+    ) -> None:
+        """Legacy front-only builder (kept for backwards compatibility)."""
+        slots = self._flatten_slots(expanded)
+        if not slots:
+            raise RuntimeError("No images available to build the PDF.")
+        valid_slots = [s for s in slots if s.exists()]
+        if not valid_slots:
+            raise RuntimeError("No downloaded images exist on disk.")
+        self._build_front_pages(valid_slots, pdf_path)
+
+    def _build_front_pages(
+        self,
+        front_slots: list[Path],
+        pdf_path: Path,
+    ) -> None:
+        """Render front pages in natural order (no mirroring)."""
+        if not front_slots:
+            raise RuntimeError("No images available to build the PDF.")
+        (
+            cols,
+            rows,
+            per_page,
+            page_w_px,
+            page_h_px,
+            card_w_px,
+            card_h_px,
+            gap_px,
+            bleed_px,
+            start_x,
+            start_y,
+        ) = self._page_geometry()
 
         page_images: list[Image.Image] = []
-        for page_start in range(0, len(valid_slots), per_page):
-            page_slots = valid_slots[page_start : page_start + per_page]
+        for page_start in range(0, len(front_slots), per_page):
+            page_slots = front_slots[page_start : page_start + per_page]
             page = Image.new("RGB", (page_w_px, page_h_px), "white")
             draw = ImageDraw.Draw(page)
             for idx, slot_path in enumerate(page_slots):
@@ -226,13 +416,82 @@ class Exporter:
             )
             page_images.append(page)
 
-        page_images[0].save(
-            str(pdf_path),
-            "PDF",
-            resolution=self.target_dpi,
-            save_all=True,
-            append_images=page_images[1:],
-        )
+        self._save_pages(page_images, pdf_path)
+
+    def _build_back_pages(
+        self,
+        back_slots: list[Path | None],
+        pdf_path: Path,
+    ) -> None:
+        """Render back pages mirrored for manual duplex (flip on long edge).
+
+        ``back_slots`` is in front order (index ``i`` is the back of front
+        ``i``; ``None`` = single-sided blank). Each page keeps the exact
+        same slot size, gutter, margins and upright orientation as the
+        front PDF; only columns are mirrored
+        (``mirror_col = cols - 1 - col``) so that after printing the fronts,
+        flipping the stack like a book (long edge) and printing the backs
+        at 100 % puts every back exactly behind its front. Crop marks are
+        identical to the front pages. Trailing fully-blank pages are
+        dropped (never rendered) so the back PDF contains no blank pages;
+        middle pages keep their blanks to preserve page-to-page alignment.
+        """
+        if not back_slots or not any(b is not None for b in back_slots):
+            raise RuntimeError("No back images available to build the back PDF.")
+        (
+            cols,
+            rows,
+            per_page,
+            page_w_px,
+            page_h_px,
+            card_w_px,
+            card_h_px,
+            gap_px,
+            bleed_px,
+            start_x,
+            start_y,
+        ) = self._page_geometry()
+
+        # Split into pages and drop trailing fully-blank ones so the back
+        # PDF never ends with (nor, combined with backs-first ordering,
+        # contains) empty pages. Middle pages keep their blanks so page N
+        # of the back still belongs behind page N of the front.
+        pages = [
+            back_slots[page_start : page_start + per_page]
+            for page_start in range(0, len(back_slots), per_page)
+        ]
+        while pages and all(s is None or not s.exists() for s in pages[-1]):
+            pages.pop()
+        if not pages:
+            raise RuntimeError("No back images available to build the back PDF.")
+
+        page_images: list[Image.Image] = []
+        for page_slots in pages:
+            page = Image.new("RGB", (page_w_px, page_h_px), "white")
+            draw = ImageDraw.Draw(page)
+            for idx, slot_path in enumerate(page_slots):
+                if slot_path is None or not slot_path.exists():
+                    continue  # single-sided front -> blank back keeps alignment
+                col = idx % cols
+                row = idx // cols
+                mirror_col = (cols - 1) - col
+                x = start_x + mirror_col * (card_w_px + gap_px)
+                y = start_y + row * (card_h_px + gap_px)
+                self._paste_card(page, slot_path, x, y, card_w_px, card_h_px, bleed_px)
+            self._draw_crop_marks(
+                draw,
+                start_x,
+                start_y,
+                cols,
+                rows,
+                card_w_px,
+                card_h_px,
+                gap_px,
+                bleed_px,
+            )
+            page_images.append(page)
+
+        self._save_pages(page_images, pdf_path)
 
     def _flatten_slots(self, expanded: Iterable[tuple[Path, int]]) -> list[Path]:
         """Expand ``(image_path, quantity)`` into a flat list of per-card slots."""

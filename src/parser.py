@@ -194,11 +194,43 @@ def _strip_trailing_markers(name: str) -> tuple[str, bool, str | None]:
     return name, foil, art
 
 
+def _split_front_back(name_part: str, raw_line: str) -> tuple[str, str | None]:
+    """Split the post-quantity text into ``(front_part, back_part)``.
+
+    A single ``/`` separator marks a double-sided card: everything before
+    it is the front face, everything after it is the back face. Only one
+    separator is allowed per line. A missing/blank back part means
+    single-sided. A ``|`` is accepted as a legacy alias for ``/``.
+
+    A double slash (``//``, e.g. MTG split cards like ``Fire // Ice``) is
+    never a separator: only a ``/`` neither preceded nor followed by
+    another ``/`` splits.
+    """
+    if "|" in name_part:
+        parts = name_part.split("|")
+        if len(parts) != 2 or any(
+            re.search(r"(?<!/)/(?!/)", part) for part in parts
+        ):
+            raise ValueError(
+                f"Invalid decklist line (only one '/' separator allowed): {raw_line!r}"
+            )
+        return parts[0], parts[1]
+    indices = [m.start() for m in re.finditer(r"(?<!/)/(?!/)", name_part)]
+    if not indices:
+        return name_part, None
+    if len(indices) > 1:
+        raise ValueError(
+            f"Invalid decklist line (only one '/' separator allowed): {raw_line!r}"
+        )
+    idx = indices[0]
+    return name_part[:idx], name_part[idx + 1 :]
+
+
 def parse_deck_file(file_path: str) -> tuple[str, list[DeckCard]]:
     """Read a decklist .txt file and return (deck_name, cards).
 
     Each non-empty line is expected to follow the format:
-        <quantity> <full card name> [art] [*F*]
+        <quantity> <full card name> [art] [*F*] [/ <back card name> [art] [*F*]]
 
     A trailing ``*F*``/``*G*`` marks the entry as foil and a trailing
     ``[art]`` requests a specific art variant. Lorcana markers are
@@ -210,6 +242,22 @@ def parse_deck_file(file_path: str) -> tuple[str, list[DeckCard]]:
     + variant combo (``[m21 borderless]``, ``[2x2:117 showcase]``).
     Both markers are stripped from the name and exposed as
     ``DeckCard.foil`` / ``DeckCard.art``; they may appear in either order.
+
+    Double-sided cards append the back face after a ``/`` separator on the
+    same line (the quantity applies to both faces, the back face takes no
+    quantity of its own)::
+
+        4 Delver of Secrets / Insectile Aberration
+        2 Hades - King of Olympus [enchanted] / Hades - Lord of the Dead [base]
+        1 Lightning Bolt [m21] *F* / Mountain [fullart]
+
+    (``|`` still works as a legacy alias for ``/``. ``//`` inside a card
+    name, e.g. MTG split cards like ``Fire // Ice``, is never a separator.)
+
+    Each side strips its own trailing ``[art]`` / ``*F*`` markers
+    independently (``back_name`` / ``back_art`` / ``back_foil``). PDF
+    grouping (regular vs foil) always follows the front-face foil flag so
+    front/back pages stay aligned.
     """
     path = Path(file_path)
     deck_name = path.stem
@@ -223,14 +271,36 @@ def parse_deck_file(file_path: str) -> tuple[str, list[DeckCard]]:
             match = re.match(r"^(\d+)\s+(.+)$", line)
             if not match:
                 raise ValueError(f"Invalid decklist line: {raw_line!r}")
-            quantity, name = match.groups()
-            clean_name, foil, art = _strip_trailing_markers(name.strip())
+            quantity, name_part = match.groups()
+            front_part, back_part = _split_front_back(name_part, raw_line)
+            if not front_part.strip():
+                raise ValueError(f"Invalid decklist line (missing front name): {raw_line!r}")
+            clean_name, foil, art = _strip_trailing_markers(front_part.strip())
+            if not clean_name:
+                raise ValueError(f"Invalid decklist line (missing front name): {raw_line!r}")
+            back_name: str | None = None
+            back_art: str | None = None
+            back_foil = False
+            if back_part is not None and back_part.strip():
+                clean_back, clean_back_foil, clean_back_art = _strip_trailing_markers(
+                    back_part.strip()
+                )
+                if not clean_back:
+                    raise ValueError(
+                        f"Invalid decklist line (missing back name): {raw_line!r}"
+                    )
+                back_name = clean_back
+                back_art = clean_back_art
+                back_foil = clean_back_foil
             cards.append(
                 DeckCard(
                     quantity=int(quantity),
                     name=clean_name,
                     foil=foil,
                     art=art,
+                    back_name=back_name,
+                    back_art=back_art,
+                    back_foil=back_foil,
                 )
             )
 

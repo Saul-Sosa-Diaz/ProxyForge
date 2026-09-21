@@ -60,8 +60,25 @@ alongside a print-ready PDF configured to exact physical card dimensions
 Each non-empty line of the deck file must follow:
 
 ```text
-<quantity> <full card name> [art] [*F*]
+<quantity> <full card name> [art] [*F*] [/ <back card name> [art] [*F*]]
 ```
+
+Append `/ <back card name>` on the same line to make a double-sided card.
+The quantity applies to both faces (the back takes no quantity of its own)
+and each side strips its own trailing `[art]` / `*F*` markers independently:
+
+```text
+2 Delver of Secrets / Insectile Aberration
+2 Hades - King of Olympus [enchanted] / Hades - Lord of the Dead [base]
+1 Lightning Bolt [m21] *F* / Mountain [fullart]
+4 Knight
+```
+
+Lines without `/` stay single-sided (their back slot prints blank so every
+other card keeps its alignment).
+
+> 💡 `|` still works as a legacy alias for `/`. A double slash (`//`,
+> e.g. MTG split cards like `Fire // Ice`) is never a separator.
 
 **Example** (`input/my_awesome_deck.txt`):
 
@@ -165,8 +182,10 @@ For a deck file named `my_awesome_deck.txt`, the application produces:
 ```text
 output/my_awesome_deck/
 ├── images/                              # uniquely downloaded card images
-├── my_awesome_deck_printable.pdf        # regular cards
-└── my_awesome_deck_printable_foil.pdf   # foil entries only (when present)
+├── my_awesome_deck_printable.pdf        # regular cards (fronts)
+├── my_awesome_deck_printable_back.pdf   # regular backs (when any "/" present)
+├── my_awesome_deck_printable_foil.pdf   # foil entries only (when present)
+└── my_awesome_deck_printable_foil_back.pdf  # foil backs (when any foil "/" present)
 ```
 
 Decklist entries marked as foil/premium with a trailing `*F*` (Manabox) or
@@ -175,9 +194,33 @@ be printed on separate (e.g. holographic) paper stock; the marker is
 stripped from the card name before fetching. Decks without foil entries
 only produce the regular PDF.
 
+Double-sided entries (`/ Back Name`) additionally emit a `*_back.pdf` whose
+grid coincides exactly with the front PDF — same 63 x 88 mm slots, same
+gutter, same margins, same upright orientation — with columns mirrored, so
+each back lands exactly behind its front. Double-sided cards render first
+(within each finish), so the back PDF starts printing backs from page 1 and
+contains no blank pages; single-sided cards follow in file order and leave a
+blank back slot behind their front. The back PDF may therefore be shorter
+than the front PDF — page *N* of the back still belongs behind page *N* of
+the front. Grouping always follows the front-face foil flag, so regular
+fronts pair with the regular back PDF and foil fronts with the foil back
+PDF.
+
 The PDFs arrange cards into a multi-page grid on A4 paper. Each card slot is
 exactly **63 x 88 mm**, separated by a 3 mm gutter with 1 mm artwork bleed into it,
 plus crop marks in the outer margins for clean physical trimming after printing.
+
+### 🖨️ Printing double-sided cards
+
+1. Print `*_printable.pdf` single-sided at **100 % / actual size** (no
+   fit-to-page).
+2. Flip the stack **like a book (long edge, top stays on top)** and reinsert
+   it.
+3. Print `*_printable_back.pdf` single-sided at 100 % on the reverse.
+   Page *N* of the back file belongs behind page *N* of the front file, in
+   the same upright orientation (the back file has no blank pages and may
+   have fewer pages — the extra front pages at the end are single-sided).
+   Do the same pairing for the `*_foil*.pdf` files on holographic stock.
 
 ---
 

@@ -23,6 +23,31 @@ class DeckCard(BaseModel):
             "available art)."
         ),
     )
+    back_name: str | None = Field(
+        default=None,
+        description=(
+            "Optional back-face card name for double-sided cards, given after a "
+            "'/' separator on the same decklist line "
+            "('2 Lightning Bolt / Shock'). When set, the back image is printed "
+            "in the mirrored slot of a separate '_back' PDF so manual duplex "
+            "(flip on long edge) aligns front and back."
+        ),
+    )
+    back_art: str | None = Field(
+        default=None,
+        description=(
+            "Art variant requested for the back face via a trailing '[variant]' "
+            "marker on the back side of the '/' separator."
+        ),
+    )
+    back_foil: bool = Field(
+        default=False,
+        description=(
+            "Foil marker parsed from the back side of the '/' separator. "
+            "It is informational only: PDF grouping (regular vs foil) always "
+            "follows the front-face 'foil' flag so front/back pages stay aligned."
+        ),
+    )
 
 
 class DownloadResult(BaseModel):
