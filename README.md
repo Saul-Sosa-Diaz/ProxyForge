@@ -233,31 +233,6 @@ fit-to-page), and separately `foil_<deck>.pdf` on holographic stock.
 
 ---
 
-## 🗄️ LorcanaJSON Database (Lorcana)
-
-On every run the Lorcana strategy downloads the full card database from
-**LorcanaJSON** (`https://lorcanajson.org/files/current/en/allCards.json.zip`)
-— nothing is cached on disk.
-
-Each card in the database follows the LorcanaJSON schema; the strategy reads the
-`fullName` / `simpleName` fields for matching and the `images.full` URL
-(usually 1468 x 2048 px) for downloads.
-
-```json
-{
-  "cards": [
-    {
-      "fullName": "Mickey Mouse - Steamboat Pilot",
-      "simpleName": "mickey mouse steamboat pilot",
-      "images": { "full": "https://.../mickey-steamboat.png" }
-    }
-  ]
-}
-```
-
-When a card is not present in the LorcanaJSON database, the strategy falls
-back to scraping `https://lorcana.gg/cards/`.
-
 ### 🎨 Art Selection (`[art]` decklist marker, Lorcana + MTG)
 
 Most Lorcana cards exist in several art variants that share the same name:
