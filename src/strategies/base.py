@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 
+from ..models import ArtOption
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,3 +79,19 @@ class TCGStrategy(ABC):
             otherwise ``False`` (single-faced card or unresolvable back).
         """
         return False
+
+    def list_art_options(self, card_name: str) -> list[ArtOption]:
+        """List the arts available for a card (web UI art picker).
+
+        Each option's ``value`` is an ``[art]`` marker that, passed to
+        :meth:`fetch_card_image`, downloads exactly that art. Only
+        strategies with ``supports_art = True`` override this; the default
+        offers no alternatives. Must not raise.
+
+        Args:
+            card_name: Full name of the card, as written in the decklist.
+
+        Returns:
+            The selectable arts (empty when none are known).
+        """
+        return []

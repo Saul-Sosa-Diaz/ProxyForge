@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+import re
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from .models import DeckCard
+from .models import DeckCard, ResolvedCard
 from .strategies.base import TCGStrategy
 
 logger = logging.getLogger(__name__)
@@ -88,10 +89,57 @@ class Exporter:
         return value_mm * self.target_dpi / MM_PER_INCH
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Public API
     # ------------------------------------------------------------------
     def export_deck(self, deck_name: str, cards: list[DeckCard]) -> Path:
-        """Download images and emit one PDF per finish (regular / foil).
+        """Download images and build the PDFs in one go (CLI entry point).
+
+        Equivalent to :meth:`resolve_images` followed by :meth:`render_pdfs`.
+
+        Returns:
+            The first PDF written (see :meth:`render_pdfs` for the order).
+        """
+        return self.render_pdfs(deck_name, self.resolve_images(deck_name, cards))[0]
+
+    def resolve_images(
+        self,
+        deck_name: str,
+        cards: list[DeckCard],
+        on_progress: Callable[[int, int, DeckCard], None] | None = None,
+    ) -> list[ResolvedCard]:
+        """Download phase: fetch every unique face image once.
+
+        Images land in ``<output>/<deck_name>/images`` and are reused across
+        calls (an existing ``.png`` is never fetched again), so resolving a
+        single edited entry later only downloads what changed. The same
+        image file is shared by entries that only differ in finish (foil vs
+        regular) or by a front and a back requesting the same name +
+        ``[art]``; entries with a different ``[art]`` marker get their own
+        image file. Entries without an explicit ``/ Back`` ask the strategy
+        for an automatic back face (e.g. MTG double-faced cards).
+
+        Args:
+            deck_name: Deck name; selects the output subfolder.
+            cards: Decklist entries in deck order.
+            on_progress: Optional callback ``(index, total, card)`` invoked
+                before each entry is resolved.
+
+        Returns:
+            One :class:`ResolvedCard` per entry in deck order, including
+            failed ones (``front_path is None``).
+        """
+        images_dir = self.output_base / deck_name / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        unique: dict[str, Path] = {}
+        resolved: list[ResolvedCard] = []
+        for index, card in enumerate(cards):
+            if on_progress is not None:
+                on_progress(index, len(cards), card)
+            resolved.append(self._resolve_card(card, images_dir, unique))
+        return resolved
+
+    def render_pdfs(self, deck_name: str, resolved: list[ResolvedCard]) -> list[Path]:
+        """Render phase: emit one PDF per finish (regular / foil).
 
         Foil entries (``DeckCard.foil``) are rendered into
         ``foil_<deck_name>.pdf`` so they can be printed on
@@ -113,59 +161,43 @@ class Exporter:
         upright orientation — with columns mirrored so manual duplex
         ("flip on long edge", print at 100 %) aligns each back with its
         front. Grouping always follows the front-face foil flag.
+
+        Args:
+            deck_name: Deck name; selects the output subfolder and PDF names.
+            resolved: Output of :meth:`resolve_images` (possibly edited).
+                Entries without a front image are skipped.
+
+        Returns:
+            Every PDF written, regular before foil and, within a finish,
+            single-sided before the front/back pair.
+
+        Raises:
+            RuntimeError: If no entry has a front image to render.
         """
         deck_dir = self.output_base / deck_name
-        images_dir = deck_dir / "images"
-        images_dir.mkdir(parents=True, exist_ok=True)
+        deck_dir.mkdir(parents=True, exist_ok=True)
 
-        expanded = self._download_unique_cards(cards, images_dir)
-        regular = [(f, b, qty) for f, b, qty, foil in expanded if not foil]
-        foils = [(f, b, qty) for f, b, qty, foil in expanded if foil]
-        if not regular and not foils:
+        pdf_paths: list[Path] = []
+        for foil, prefix, tag in ((False, "", "PDF"), (True, "foil_", "Foil PDF")):
+            group = [
+                (r.front_path, r.back_path, r.card.quantity)
+                for r in resolved
+                if r.front_path is not None and r.card.foil == foil
+            ]
+            if not group:
+                logger.debug("Deck '%s' has no %s cards.", deck_name, tag)
+                continue
+            singles = [(f, q) for f, b, q in group if b is None]
+            duals = [(f, b, q) for f, b, q in group if b is not None]
+            if singles:
+                pdf_path = deck_dir / f"{prefix}{deck_name}.pdf"
+                self._build_pdf(singles, pdf_path)
+                logger.info("%s written to %s", tag, pdf_path)
+                pdf_paths.append(pdf_path)
+            pdf_paths.extend(self._emit_dual_pdfs(deck_dir, deck_name, duals, foil=foil))
+        if not pdf_paths:
             raise RuntimeError("No images available to build the PDF.")
-
-        pdf_path: Path | None = None
-        if regular:
-            reg_singles = [(f, q) for f, b, q in regular if b is None]
-            reg_duals = [(f, b, q) for f, b, q in regular if b is not None]
-            if reg_singles:
-                front_pdf_path = deck_dir / f"{deck_name}.pdf"
-                self._build_pdf(reg_singles, front_pdf_path)
-                logger.info("PDF written to %s", front_pdf_path)
-                pdf_path = pdf_path or front_pdf_path
-            else:
-                logger.debug(
-                    "Deck '%s' has no single-sided regular cards; no regular PDF generated.",
-                    deck_name,
-                )
-            dual_pdf_path = self._emit_dual_pdfs(
-                deck_dir, deck_name, reg_duals, foil=False
-            )
-            pdf_path = pdf_path or dual_pdf_path
-        if foils:
-            foil_singles = [(f, q) for f, b, q in foils if b is None]
-            foil_duals = [(f, b, q) for f, b, q in foils if b is not None]
-            if foil_singles:
-                foil_pdf_path = deck_dir / f"foil_{deck_name}.pdf"
-                self._build_pdf(foil_singles, foil_pdf_path)
-                logger.info("Foil PDF written to %s", foil_pdf_path)
-                pdf_path = pdf_path or foil_pdf_path
-            else:
-                logger.debug(
-                    "Deck '%s' has no single-sided foil cards; no foil PDF generated.",
-                    deck_name,
-                )
-            dual_foil_pdf_path = self._emit_dual_pdfs(
-                deck_dir, deck_name, foil_duals, foil=True
-            )
-            pdf_path = pdf_path or dual_foil_pdf_path
-        else:
-            logger.debug(
-                "Deck '%s' has no foil cards; no foil PDF generated.", deck_name
-            )
-        if pdf_path is None:
-            raise RuntimeError("No images available to build the PDF.")
-        return pdf_path
+        return pdf_paths
 
     def _emit_dual_pdfs(
         self,
@@ -173,17 +205,17 @@ class Exporter:
         deck_name: str,
         duals: list[tuple[Path, Path | None, int]],
         foil: bool,
-    ) -> Path | None:
+    ) -> list[Path]:
         """Emit the separated double-sided PDFs for one finish.
 
-        Returns the dual front PDF path, or ``None`` when there is
-        nothing to render. ``duals`` holds ``(front, back_or_None, qty)``
-        pairs in deck order; fronts keep that order and backs mirror it,
-        so both PDFs share pagination 1:1 with no blank pages (a failed
-        back download degrades to a blank slot).
+        Returns the PDFs written (front, then back when any back image
+        exists); empty when there is nothing to render. ``duals`` holds
+        ``(front, back_or_None, qty)`` pairs in deck order; fronts keep that
+        order and backs mirror it, so both PDFs share pagination 1:1 with no
+        blank pages (a failed back download degrades to a blank slot).
         """
         if not duals:
-            return None
+            return []
         tag = "Foil dual-sided" if foil else "Dual-sided"
         prefix = "foil_front_" if foil else "front_"
         back_prefix = "foil_back_" if foil else "back_"
@@ -195,15 +227,17 @@ class Exporter:
                 tag,
                 deck_name,
             )
-            return None
+            return []
         dual_front_pdf = deck_dir / f"{prefix}{deck_name}.pdf"
         self._build_front_pages(front_flat, dual_front_pdf)
         logger.info("%s front PDF written to %s", tag, dual_front_pdf)
+        written = [dual_front_pdf]
         if any(b is not None for b in back_flat):
             dual_back_pdf = deck_dir / f"{back_prefix}{deck_name}.pdf"
             self._build_back_pages(back_flat, dual_back_pdf)
             logger.info("%s back PDF written to %s", tag, dual_back_pdf)
-        return dual_front_pdf
+            written.append(dual_back_pdf)
+        return written
 
     # ------------------------------------------------------------------
     # De-duplicated downloads
@@ -231,55 +265,35 @@ class Exporter:
         unique[key] = image_path
         return image_path
 
-    def _download_unique_cards(
+    def _resolve_card(
         self,
-        cards: list[DeckCard],
+        card: DeckCard,
         images_dir: Path,
-    ) -> list[tuple[Path, Path | None, int, bool]]:
-        """Download each unique card once and expand quantities after the fact.
+        unique: dict[str, Path],
+    ) -> ResolvedCard:
+        """Fetch the front and back images of one decklist entry.
 
-        Returns a list of ``(front_path, back_path_or_None, quantity,
-        front_foil)`` tuples in deck order. The same image file is shared
-        by entries that only differ in finish (foil vs regular) or by a
-        front and a back requesting the same name + ``[art]``; entries with
-        a different ``[art]`` marker get their own image file. A failed
-        front download skips the whole entry (its back has no slot to
-        align to); a failed back download degrades to a blank back slot.
-        Entries without an explicit ``/ Back`` ask the strategy for an
-        automatic back face (e.g. MTG double-faced cards), so a single
-        decklist line can still yield both sides.
+        A failed front download leaves the entry without images (its back
+        has no slot to align to); a failed back download degrades to a
+        blank back slot.
         """
-        unique: dict[str, Path] = {}
-        expanded: list[tuple[Path, Path | None, int, bool]] = []
-
-        for card in cards:
-            front_path = self._fetch_single_image(
-                card.name, card.art, images_dir, unique
+        front_path = self._fetch_single_image(card.name, card.art, images_dir, unique)
+        if front_path is None:
+            return ResolvedCard(card=card)
+        if not card.back_name:
+            back_path = self._fetch_automatic_back(card.name, card.art, images_dir, unique)
+            return ResolvedCard(card=card, front_path=front_path, back_path=back_path)
+        back_path = self._fetch_single_image(
+            card.back_name, card.back_art, images_dir, unique
+        )
+        if back_path is None:
+            logger.warning(
+                "Failed to fetch back image for '%s' (front '%s'); "
+                "leaving its back slot blank.",
+                card.back_name,
+                card.name,
             )
-            if front_path is None:
-                continue
-            back_path: Path | None = None
-            if card.back_name:
-                fetched_back = self._fetch_single_image(
-                    card.back_name, card.back_art, images_dir, unique
-                )
-                if fetched_back is None:
-                    logger.warning(
-                        "Failed to fetch back image for '%s' (front '%s'); "
-                        "leaving its back slot blank.",
-                        card.back_name,
-                        card.name,
-                    )
-                    back_path = None
-                else:
-                    back_path = fetched_back
-            else:
-                back_path = self._fetch_automatic_back(
-                    card.name, card.art, images_dir, unique
-                )
-            expanded.append((front_path, back_path, card.quantity, card.foil))
-
-        return expanded
+        return ResolvedCard(card=card, front_path=front_path, back_path=back_path)
 
     def _fetch_automatic_back(
         self,
@@ -693,8 +707,6 @@ class Exporter:
 # Helpers
 # ----------------------------------------------------------------------
 def _sanitize_filename(name: str) -> str:
-    import re
-
     cleaned = re.sub(r"[^\w\s()-]", "", name)
     cleaned = re.sub(r"\s+", "_", cleaned.strip())
     return cleaned or "card"
@@ -704,5 +716,9 @@ def _image_key(name: str, art: str | None) -> str:
     """De-duplication key (and file stem) for one card face image."""
     key = _sanitize_filename(name)
     if art:
-        key = f"{key}_{art}"
+        # Art values like '2x2:117' or 'm21 borderless' must not leak ':' or
+        # spaces into the file name (':' is invalid on Windows).
+        # '★' marks a distinct MTG printing (sld:1512★ vs sld:1512).
+        art_slug = re.sub(r"[^\w]+", "-", art.replace("★", "star")).strip("-")
+        key = f"{key}_{art_slug}"
     return key

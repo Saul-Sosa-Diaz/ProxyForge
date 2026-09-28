@@ -1,0 +1,29 @@
+{
+  "object": "list",
+  "has_more": false,
+  "data": [
+    {
+      "name": "Sol Ring", "set": "c21", "set_name": "Commander 2021", "collector_number": "263",
+      "border_color": "black", "frame": "2015", "full_art": false, "promo": false,
+      "image_uris": {"small": "https://img.test/sol-c21-small.jpg", "normal": "https://img.test/sol-c21.jpg"}
+    },
+    {
+      "name": "Sol Ring", "set": "sld", "set_name": "Secret Lair Drop", "collector_number": "1512★",
+      "border_color": "borderless", "frame": "2015", "full_art": false, "promo": false,
+      "image_uris": {"normal": "https://img.test/sol-sld.jpg"}
+    },
+    {
+      "name": "Sol Ring", "set": "plst", "set_name": "The List", "collector_number": "C21-263",
+      "border_color": "black", "frame": "2015",
+      "image_uris": {"normal": "https://img.test/sol-plst.jpg"}
+    },
+    {
+      "name": "Sol Ring // Sol Ring", "set": "sunf", "set_name": "Unfinity Sticker", "collector_number": "7",
+      "border_color": "black", "frame": "2015",
+      "card_faces": [
+        {"name": "Sol Ring", "image_uris": {"normal": "https://img.test/sol-front.jpg"}},
+        {"name": "Sol Ring", "image_uris": {"normal": "https://img.test/sol-back.jpg"}}
+      ]
+    }
+  ]
+}

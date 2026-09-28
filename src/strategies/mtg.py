@@ -61,6 +61,7 @@ from typing import Any
 
 import requests
 
+from ..models import ArtOption
 from .base import TCGStrategy
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,21 @@ class MTGStrategy(TCGStrategy):
             f" (back: '{back_name}')" if back_name else "",
         )
         return self._download_image(back_url, output_path)
+
+    def list_art_options(self, card_name: str) -> list[ArtOption]:
+        """List every printing of a card (newest first) as ``set:collector`` arts.
+
+        Printings whose set/collector cannot be written as an ``[art]``
+        marker (e.g. The List's ``plst:BLC-129``) are skipped. Tokens and
+        other extras are only searched when the card has no regular
+        printing (``Bird (teoc)``).
+        """
+        clean_name, _, _ = _parse_card_reference(card_name)
+        prints = self._search_all_prints(f'!"{clean_name}"')
+        if not prints:
+            prints = self._search_all_prints(f'!"{clean_name}" include:extras')
+        options = [_art_option(card) for card in prints]
+        return [option for option in options if option is not None]
 
     # ------------------------------------------------------------------
     # Resolution helpers
@@ -268,9 +284,11 @@ class MTGStrategy(TCGStrategy):
 
         The endpoint returns whatever lives at that slot, so when
         ``expected_name`` is given the returned card is checked against it
-        (front face included for double-faced cards). On a mismatch ``None``
-        is returned and the caller falls back to the name lookup instead of
-        silently downloading the wrong card.
+        (front face included for double-faced cards, and the printing's
+        alternate ``flavor_name`` too: Secret Lair / Universes Beyond decks
+        list ``Chaos Emerald (SLD) 7037`` for that Lotus Petal). On a
+        mismatch ``None`` is returned and the caller falls back to the name
+        lookup instead of silently downloading the wrong card.
         """
         endpoint = (
             f"/cards/{requests.utils.quote(set_code.lower())}"
@@ -280,7 +298,7 @@ class MTGStrategy(TCGStrategy):
         card = self._api_get(endpoint, {})
         if not card:
             return None
-        if expected_name is not None and not _names_match(card.get("name"), expected_name):
+        if expected_name is not None and not _names_match(card, expected_name):
             logger.warning(
                 "Scryfall %s:%s is '%s', not '%s'; ignoring the collector number and "
                 "falling back to name lookup.",
@@ -780,6 +798,33 @@ def _matches_variant(card: dict[str, Any], variant: str) -> bool:
     return False
 
 
+def _art_option(card: dict[str, Any]) -> ArtOption | None:
+    """Build the art-picker option of one Scryfall printing (``None`` if unusable)."""
+    set_code = str(card.get("set") or "").lower()
+    collector = str(card.get("collector_number") or "").lower()
+    value = f"{set_code}:{collector}"
+    if not _SET_COLLECTOR_JOINED.match(value) or card.get("image_status") == "missing":
+        return None
+    image_uris = card.get("image_uris")
+    if not isinstance(image_uris, dict):
+        faces = card.get("card_faces")
+        if isinstance(faces, list) and faces and isinstance(faces[0], dict):
+            image_uris = faces[0].get("image_uris")
+    if not isinstance(image_uris, dict):
+        return None
+    image_url = image_uris.get("normal") or image_uris.get("small")
+    if not isinstance(image_url, str) or not image_url:
+        return None
+    label = f"{card.get('set_name') or set_code.upper()} ({set_code.upper()}) #{collector}"
+    variants = [v for v in MTG_VARIANT_CHOICES if _matches_variant(card, v)]
+    if variants:
+        label += " · " + ", ".join(variants)
+    if card.get("flavor_name") and card.get("name"):
+        # Alternate-name printing (e.g. SLD "Chaos Emerald"): show the real card.
+        label += f" · {card['name']}"
+    return ArtOption(value=value, label=label, image_url=image_url)
+
+
 def _is_base_print(card: dict[str, Any]) -> bool:
     """Standard (non-premium) printing: no promo, no alt-art treatments."""
     if card.get("promo"):
@@ -831,17 +876,30 @@ _SET_ONLY = re.compile(rf"^(?P<set>{_SET_CODE})$", re.IGNORECASE)
 _COLLECTOR_ONLY = re.compile(rf"^(?P<collector>{_COLLECTOR})$", re.IGNORECASE)
 
 
-def _names_match(returned_name: Any, expected_name: str) -> bool:
-    """Check a Scryfall card name against the requested one (face-aware).
+def _names_match(card: dict[str, Any], expected_name: str) -> bool:
+    """Check a Scryfall card against the requested name.
 
-    Double-faced cards report ``"Front // Back"``; a request for either face
-    counts as a match.
+    Accepted: the Oracle name or either face of a double-faced card
+    (``"Front // Back"``), and the printing's alternate ``flavor_name``
+    (card-level or per face), e.g. ``Chaos Emerald`` for SLD's Lotus Petal.
     """
-    if not isinstance(returned_name, str) or not returned_name:
-        return False
-    expected = _normalize(expected_name)
-    faces = [_normalize(face) for face in returned_name.split("//")]
-    return expected in faces
+    return _normalize(expected_name) in _card_names(card)
+
+
+def _card_names(card: dict[str, Any]) -> set[str]:
+    """Normalized names a printing answers to (Oracle, faces, flavor names)."""
+    sources = [card]
+    faces = card.get("card_faces")
+    if isinstance(faces, list):
+        sources.extend(face for face in faces if isinstance(face, dict))
+    names: set[str] = set()
+    for source in sources:
+        for key in ("name", "flavor_name"):
+            value = source.get(key)
+            if isinstance(value, str):
+                names.update(_normalize(part) for part in value.split("//"))
+    names.discard("")
+    return names
 
 
 def _parse_retry_after(value: str | None, default: float) -> float:

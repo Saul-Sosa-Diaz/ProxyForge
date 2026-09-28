@@ -57,3 +57,72 @@ def test_falls_back_to_moxfield(tmp_path):
 def test_not_found_returns_false(tmp_path):
     strategy = _strategy({})
     assert not strategy.fetch_card_image("Unknown Card", str(tmp_path / "u.png"))
+
+
+def test_list_art_options_lists_printings(tmp_path):
+    strategy = _strategy({"/cards/search": _json("mtg_prints_sol_ring.json")})
+
+    options = strategy.list_art_options("Sol Ring (C21) 263")
+
+    assert [o.value for o in options] == ["c21:263", "sld:1512★", "sunf:7"]  # plst:C21-263 skipped
+    assert options[0].label == "Commander 2021 (C21) #263"
+    assert options[0].image_url == "https://img.test/sol-c21.jpg"
+    assert "borderless" in options[1].label
+    assert options[2].image_url == "https://img.test/sol-front.jpg"  # front face of a DFC
+    assert 'q=!"Sol Ring"' in strategy._session.calls[0]
+
+
+def test_list_art_options_falls_back_to_extras(tmp_path):
+    strategy = _strategy({"include:extras": _json("mtg_prints_sol_ring.json")})
+
+    options = strategy.list_art_options("Bird (teoc)")
+
+    assert options
+    assert "include:extras" in strategy._session.calls[-1]
+
+
+def test_art_option_downloads_that_printing(tmp_path):
+    strategy = _strategy({
+        "/cards/search": _json("mtg_prints_sol_ring.json"),
+        "/cards/c21/263": _json("mtg_dark_leo.json"),
+    })
+    option = strategy.list_art_options("Dark Leo & Shredder")[0]
+
+    assert strategy.fetch_card_image("Dark Leo & Shredder", str(tmp_path / "d.png"), art=option.value)
+    assert any("/cards/c21/263" in call for call in strategy._session.calls)
+
+
+def test_list_art_options_without_results_is_empty():
+    assert _strategy({}).list_art_options("Unknown Card") == []
+
+
+def test_collector_lookup_accepts_flavor_name(tmp_path, caplog):
+    strategy = _strategy({"/cards/sld/7037": _json("mtg_chaos_emerald.json")})
+
+    assert strategy.fetch_card_image("Chaos Emerald (SLD) 7037", str(tmp_path / "c.png"))
+
+    assert "https://img.test/chaos-emerald.png" in strategy._session.calls
+    assert not any("/cards/named" in call for call in strategy._session.calls)
+    assert "ignoring the collector number" not in caplog.text
+
+
+def test_collector_lookup_still_rejects_wrong_card(tmp_path, caplog):
+    strategy = _strategy({
+        "/cards/bro/334": _json("mtg_chaos_emerald.json"),
+        "/cards/named?exact=Diabolic Intent": _json("mtg_dark_leo.json"),
+    })
+
+    assert strategy.fetch_card_image("Diabolic Intent (BRO) 334", str(tmp_path / "d.png"))
+
+    assert "ignoring the collector number" in caplog.text
+    assert "https://img.test/dark-leo.png" in strategy._session.calls
+
+
+def test_flavor_name_art_options_show_real_card(tmp_path):
+    strategy = _strategy({"/cards/search": _json("mtg_prints_chaos_emerald.json")})
+
+    options = strategy.list_art_options("Chaos Emerald (SLD) 7037")
+
+    assert [o.value for o in options] == ["sld:7037"]
+    assert options[0].label == "Secret Lair Drop (SLD) #7037 · borderless · Lotus Petal"
+    assert 'q=!"Chaos Emerald"' in strategy._session.calls[0]

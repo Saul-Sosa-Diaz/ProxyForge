@@ -98,3 +98,68 @@ def test_local_fixture_deck_end_to_end(tmp_path):
 
     assert pdf == tmp_path / "local" / "local.pdf"
     assert _page_count(pdf) == 1
+
+
+def test_resolve_images_keeps_failed_entries(tmp_path):
+    exporter = Exporter(FakeStrategy(known={"Bolt"}), str(tmp_path), target_dpi=LOW_DPI)
+    resolved = exporter.resolve_images("deck", [
+        DeckCard(quantity=1, name="Bolt"),
+        DeckCard(quantity=1, name="Missing"),
+    ])
+
+    assert [r.card.name for r in resolved] == ["Bolt", "Missing"]
+    assert resolved[0].front_path.exists()
+    assert resolved[1].front_path is None
+    assert not (tmp_path / "deck" / "deck.pdf").exists()  # nothing rendered yet
+
+
+def test_resolve_images_reports_progress(tmp_path):
+    calls = []
+    Exporter(FakeStrategy(), str(tmp_path)).resolve_images(
+        "deck",
+        [DeckCard(quantity=1, name="Bolt"), DeckCard(quantity=1, name="Shock")],
+        on_progress=lambda i, total, card: calls.append((i, total, card.name)),
+    )
+    assert calls == [(0, 2, "Bolt"), (1, 2, "Shock")]
+
+
+def test_render_pdfs_returns_every_pdf(tmp_path):
+    exporter = Exporter(FakeStrategy(), str(tmp_path), target_dpi=LOW_DPI)
+    resolved = exporter.resolve_images("deck", [
+        DeckCard(quantity=1, name="Bolt"),
+        DeckCard(quantity=1, name="Delver", back_name="Insectile"),
+        DeckCard(quantity=1, name="Shock", foil=True),
+    ])
+
+    pdfs = exporter.render_pdfs("deck", resolved)
+
+    assert [p.name for p in pdfs] == [
+        "deck.pdf", "front_deck.pdf", "back_deck.pdf", "foil_deck.pdf",
+    ]
+    assert all(p.exists() for p in pdfs)
+
+
+def test_render_pdfs_uses_edited_quantities(tmp_path):
+    exporter = Exporter(FakeStrategy(), str(tmp_path), target_dpi=LOW_DPI)
+    resolved = exporter.resolve_images("deck", [DeckCard(quantity=1, name="Bolt")])
+    edited = [resolved[0].model_copy(update={"card": resolved[0].card.model_copy(update={"quantity": 10})})]
+
+    pdf = exporter.render_pdfs("deck", edited)[0]
+
+    assert _page_count(pdf) == 2
+
+
+def test_art_marker_does_not_leak_into_file_name(tmp_path):
+    resolved = Exporter(FakeStrategy(), str(tmp_path)).resolve_images(
+        "deck", [DeckCard(quantity=1, name="Bolt", art="2x2:117 showcase")]
+    )
+    assert resolved[0].front_path.name == "Bolt_2x2-117-showcase.png"
+
+
+def test_star_printing_gets_its_own_file(tmp_path):
+    exporter = Exporter(FakeStrategy(), str(tmp_path))
+    star, plain = exporter.resolve_images("deck", [
+        DeckCard(quantity=1, name="Sol Ring", art="sld:1512★"),
+        DeckCard(quantity=1, name="Sol Ring", art="sld:1512"),
+    ])
+    assert star.front_path != plain.front_path

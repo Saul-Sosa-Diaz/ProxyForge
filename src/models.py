@@ -1,6 +1,8 @@
 """Data models for the TCG Card Image Downloader."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 
 
@@ -48,6 +50,27 @@ class DeckCard(BaseModel):
             "follows the front-face 'foil' flag so front/back pages stay aligned."
         ),
     )
+
+
+class ArtOption(BaseModel):
+    """One selectable art for a card (offered by the web UI art picker)."""
+
+    value: str = Field(description="'[art]' marker that selects this art (e.g. '2x2:117', 'enchanted').")
+    label: str = Field(description="Human-readable description (set, number, variant...).")
+    image_url: str = Field(description="Preview image URL of this art.")
+
+
+class ResolvedCard(BaseModel):
+    """A decklist entry after its images were fetched (download phase output).
+
+    ``front_path`` is ``None`` when the front image could not be fetched; the
+    entry is then left out of the PDFs. ``back_path`` is ``None`` for
+    single-sided cards and for failed back downloads (``card.back_name`` set).
+    """
+
+    card: DeckCard
+    front_path: Path | None = None
+    back_path: Path | None = None
 
 
 class DownloadResult(BaseModel):

@@ -43,3 +43,22 @@ def test_falls_back_to_lorcana_gg(tmp_path):
 def test_not_found_returns_false(tmp_path):
     strategy = _strategy()
     assert not strategy.fetch_card_image("Unknown Card", str(tmp_path / "u.png"))
+
+
+def test_list_art_options_match_downloaded_art(tmp_path):
+    strategy = _strategy()
+
+    options = strategy.list_art_options("Tramp - Enterprising Dog")
+
+    assert [(o.value, o.label) for o in options] == [
+        ("enchanted", "Enchanted"),
+        ("base", "Base (Common)"),
+    ]
+    for option in options:
+        strategy._session.calls.clear()
+        assert strategy.fetch_card_image("Tramp - Enterprising Dog", str(tmp_path / "t.png"), art=option.value)
+        assert option.image_url in strategy._session.calls
+
+
+def test_list_art_options_unknown_card_is_empty():
+    assert _strategy().list_art_options("Unknown Card") == []

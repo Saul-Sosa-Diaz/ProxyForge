@@ -28,6 +28,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 - [Features](#-features)
 - [Input Format](#-input-format)
 - [Usage](#-usage)
+- [Web UI (preview)](#-web-ui-preview)
 - [CLI Arguments](#-cli-arguments)
 - [Output](#-output)
 - [LorcanaJSON Database](#-lorcanajson-database-lorcana)
@@ -52,6 +53,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
+| 👀 **Web preview** | Streamlit UI to review, fix and re-fetch card images before building the PDFs |
 | 🖨️ **Print-ready PDF** | Multi-page A4 grid at **800 DPI** with gutter, bleed and crop marks around every 63 x 88 mm card slot |
 
 ---
@@ -162,6 +164,47 @@ pip install -r requirements.txt
 
 python src/main.py --input input/my_awesome_deck.txt --output output --tcg lorcana
 ```
+
+---
+
+## 👀 Web UI (preview)
+
+A [Streamlit](https://streamlit.io) interface to check every card image
+before printing:
+
+1. Pick the game in the sidebar, then upload a `.txt` decklist or paste it.
+2. **🔍 Buscar imágenes** downloads the images and shows the preview split
+   into one tab per generated PDF: *Normales* (`<deck>.pdf`), *Foil*
+   (`foil_<deck>.pdf`), *Front / Back* (`front_/back_<deck>.pdf`) and
+   *Foil Front / Back*, plus a tab with the cards that were not found.
+3. In the *Front / Back* tabs each front sits on top of its back with the
+   same pair number; hovering brings the back forward.
+4. **🎨 Arte** (MTG and Lorcana) opens an art picker with a preview of every
+   available art — every Scryfall printing for MTG (filterable by set or
+   variant), Enchanted / Iconic / Epic / Special / base for Lorcana. Only
+   the chosen art is downloaded. **✏️ Editar** changes name, copies or foil,
+   or removes the card. **✨ Pasar a foil / 🃏 Pasar a normales** moves a
+   card between the regular and foil PDFs in one click (or a whole tab at
+   once with *Pasar todas a …*).
+5. **🖨️ Generar PDFs** renders the same PDFs as the CLI. Each tab then offers
+   its own PDF(s) for download, and **📦 Descargar todos** bundles them in a
+   `.zip` (they are also saved under `output/<tcg>/<deck>/`).
+6. **📝 Descargar decklist (.txt)** exports the deck with every change
+   (art markers, foil, copies) in the input format; it is also saved as
+   `output/<tcg>/<deck>/<deck>.txt` and included in the `.zip`, so the
+   same deck can be rebuilt later from the web UI or the CLI.
+
+```bash
+# Docker Compose → http://localhost:8501
+docker compose up web
+
+# Local Python
+pip install -r requirements-web.txt
+streamlit run src/app.py
+```
+
+The PDF resolution can be lowered in the sidebar (300 DPI) for quick test
+prints. Set `PROXYFORGE_OUTPUT_DIR` to change the default output folder.
 
 ---
 

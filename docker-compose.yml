@@ -10,6 +10,22 @@ services:
       - ./data:/app/data
       - ./src:/app/src
 
+  # Streamlit web UI with card preview: docker compose up web -> http://localhost:8501
+  web:
+    build: .
+    profiles: ["web"]
+    container_name: tcg-downloader-web
+    ports:
+      - "8501:8501"
+    environment:
+      - PROXYFORGE_OUTPUT_DIR=/app/output
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./data:/app/data
+      - ./src:/app/src
+    entrypoint: ["streamlit", "run", "src/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
+
   # Test suite (offline). Only runs on demand: docker compose run --rm tests
   tests:
     build: .

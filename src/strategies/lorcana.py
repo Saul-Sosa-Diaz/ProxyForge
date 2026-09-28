@@ -29,6 +29,7 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
+from ..models import ArtOption
 from .base import TCGStrategy
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,32 @@ class LorcanaStrategy(TCGStrategy):
             return False
         return self._download_image(image_url, output_path)
 
+    def list_art_options(self, card_name: str) -> list[ArtOption]:
+        """List the art variants of a card (Enchanted, Iconic, Epic, Special, base).
+
+        Each option is looked up in the same per-mode index used by
+        :meth:`fetch_card_image`, so its preview is exactly the image that
+        marker downloads. Rarity modes the card lacks (which would fall
+        back to another art) are left out.
+        """
+        options: list[ArtOption] = []
+        seen_urls: set[str] = set()
+        for mode in ART_CHOICES:
+            if mode == "best":
+                continue
+            entry = self._lookup_db_entry(card_name, mode)
+            if entry is None:
+                continue
+            _score, rarity, img_url = entry
+            if mode != "base" and rarity.lower() != mode:
+                continue
+            if img_url in seen_urls:
+                continue
+            seen_urls.add(img_url)
+            label = f"Base ({rarity})" if mode == "base" and rarity else (rarity or mode.capitalize())
+            options.append(ArtOption(value=mode, label=label, image_url=img_url))
+        return options
+
     # ------------------------------------------------------------------
     # Resolution helpers
     # ------------------------------------------------------------------
@@ -118,21 +145,30 @@ class LorcanaStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     def _lookup_lorcanajson(self, card_name: str, art: str | None = None) -> str | None:
         mode = self._effective_art(art)
+        entry = self._lookup_db_entry(card_name, mode)
+        if entry is None:
+            return None
+        _score, rarity, img_url = entry
+        if mode not in ("best", "base") and rarity.lower() != mode:
+            logger.info(
+                "Card '%s' has no %s version; using its %s art",
+                card_name,
+                mode.capitalize(),
+                rarity or "available",
+            )
+        return img_url
+
+    def _lookup_db_entry(
+        self, card_name: str, mode: str
+    ) -> tuple[tuple[int, int], str, str] | None:
+        """Find a card's ``(score, rarity, image URL)`` in the ``mode`` index."""
         index = self._get_db_index(mode)
         if index is None:
             return None
         for key in _candidate_keys(card_name):
             entry = index.get(key)
             if entry is not None:
-                _score, rarity, img_url = entry
-                if mode not in ("best", "base") and rarity.lower() != mode:
-                    logger.info(
-                        "Card '%s' has no %s version; using its %s art",
-                        card_name,
-                        mode.capitalize(),
-                        rarity or "available",
-                    )
-                return img_url
+                return entry
         return None
 
     def _effective_art(self, art: str | None) -> str:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from .models import DeckCard
@@ -260,48 +261,88 @@ def parse_deck_file(file_path: str) -> tuple[str, list[DeckCard]]:
     front/back pages stay aligned.
     """
     path = Path(file_path)
-    deck_name = path.stem
-    cards: list[DeckCard] = []
-
     with path.open("r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue
-            match = re.match(r"^(\d+)\s+(.+)$", line)
-            if not match:
-                raise ValueError(f"Invalid decklist line: {raw_line!r}")
-            quantity, name_part = match.groups()
-            front_part, back_part = _split_front_back(name_part, raw_line)
-            if not front_part.strip():
-                raise ValueError(f"Invalid decklist line (missing front name): {raw_line!r}")
-            clean_name, foil, art = _strip_trailing_markers(front_part.strip())
-            if not clean_name:
-                raise ValueError(f"Invalid decklist line (missing front name): {raw_line!r}")
-            back_name: str | None = None
-            back_art: str | None = None
-            back_foil = False
-            if back_part is not None and back_part.strip():
-                clean_back, clean_back_foil, clean_back_art = _strip_trailing_markers(
-                    back_part.strip()
-                )
-                if not clean_back:
-                    raise ValueError(
-                        f"Invalid decklist line (missing back name): {raw_line!r}"
-                    )
-                back_name = clean_back
-                back_art = clean_back_art
-                back_foil = clean_back_foil
-            cards.append(
-                DeckCard(
-                    quantity=int(quantity),
-                    name=clean_name,
-                    foil=foil,
-                    art=art,
-                    back_name=back_name,
-                    back_art=back_art,
-                    back_foil=back_foil,
-                )
-            )
+        return path.stem, parse_deck_lines(f)
 
-    return deck_name, cards
+
+def format_deck(cards: Iterable[DeckCard]) -> str:
+    """Serialize cards back into decklist text (inverse of :func:`parse_deck_text`).
+
+    Each entry becomes ``<qty> <name> [art] *F* [/ <back> [art] *F*]`` so the
+    output can be fed to the CLI or the web UI to rebuild the same deck.
+    """
+    return "".join(f"{format_deck_line(card)}\n" for card in cards)
+
+
+def format_deck_line(card: DeckCard) -> str:
+    """One decklist line for ``card`` (see :func:`format_deck`)."""
+    line = f"{card.quantity} {_format_face(card.name, card.art, card.foil)}"
+    if card.back_name:
+        line += f" / {_format_face(card.back_name, card.back_art, card.back_foil)}"
+    return line
+
+
+def _format_face(name: str, art: str | None, foil: bool) -> str:
+    text = name
+    if art:
+        text += f" [{art}]"
+    if foil:
+        text += " *F*"
+    return text
+
+
+def parse_deck_text(text: str) -> list[DeckCard]:
+    """Parse decklist contents given as a string (e.g. pasted in the web UI).
+
+    Same line format as :func:`parse_deck_file`.
+    """
+    return parse_deck_lines(text.splitlines())
+
+
+def parse_deck_lines(lines: Iterable[str]) -> list[DeckCard]:
+    """Parse decklist lines into cards (see :func:`parse_deck_file` for the format).
+
+    Raises:
+        ValueError: If a non-empty line does not follow the decklist format.
+    """
+    cards: list[DeckCard] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^(\d+)\s+(.+)$", line)
+        if not match:
+            raise ValueError(f"Invalid decklist line: {raw_line!r}")
+        quantity, name_part = match.groups()
+        front_part, back_part = _split_front_back(name_part, raw_line)
+        if not front_part.strip():
+            raise ValueError(f"Invalid decklist line (missing front name): {raw_line!r}")
+        clean_name, foil, art = _strip_trailing_markers(front_part.strip())
+        if not clean_name:
+            raise ValueError(f"Invalid decklist line (missing front name): {raw_line!r}")
+        back_name: str | None = None
+        back_art: str | None = None
+        back_foil = False
+        if back_part is not None and back_part.strip():
+            clean_back, clean_back_foil, clean_back_art = _strip_trailing_markers(
+                back_part.strip()
+            )
+            if not clean_back:
+                raise ValueError(
+                    f"Invalid decklist line (missing back name): {raw_line!r}"
+                )
+            back_name = clean_back
+            back_art = clean_back_art
+            back_foil = clean_back_foil
+        cards.append(
+            DeckCard(
+                quantity=int(quantity),
+                name=clean_name,
+                foil=foil,
+                art=art,
+                back_name=back_name,
+                back_art=back_art,
+                back_foil=back_foil,
+            )
+        )
+    return cards
