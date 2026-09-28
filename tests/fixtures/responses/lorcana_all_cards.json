@@ -1,0 +1,17 @@
+{
+  "cards": [
+    {
+      "fullName": "Tramp - Enterprising Dog",
+      "simpleName": "Tramp Enterprising Dog",
+      "rarity": "Common",
+      "images": {"full": "https://img.test/tramp-common.jpg"}
+    },
+    {
+      "fullName": "Tramp - Enterprising Dog",
+      "simpleName": "Tramp Enterprising Dog",
+      "rarity": "Enchanted",
+      "baseId": 1,
+      "images": {"full": "https://img.test/tramp-enchanted.jpg"}
+    }
+  ]
+}

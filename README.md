@@ -34,6 +34,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 - [PkmnCards Naming](#-pkmncards-naming-pokémon)
 - [Local Images](#-local-images-local)
 - [Print Dimensions](#-print-dimensions)
+- [Running Tests](#-running-tests)
 - [Contributing](#-contributing)
 - [License](#-license)
 
@@ -433,6 +434,67 @@ python src/main.py --input input/my_deck.txt --output output --tcg local \
 | Grid | 3 x 3 (9 cards per page) |
 | Gutter | 3 mm |
 | Bleed | 1 mm fixed (mirrored edge) |
+
+---
+
+## 🧪 Running Tests
+
+The test suite uses **pytest** and runs fully offline: every HTTP request is
+replaced by a fake session that serves static fixtures from
+`tests/fixtures/`, so no network access (and nothing in `input/`) is needed.
+
+### Option A — Docker Compose
+
+```bash
+docker compose run --rm tests
+```
+
+The `tests` service (defined in `docker-compose.yml` under the `test`
+profile, so `docker compose up` never starts it) reuses the app image, mounts
+`src/`, `tests/`, `pytest.ini` and `requirements-dev.txt`, installs pytest and
+runs the suite. Any extra arguments are forwarded to pytest:
+
+```bash
+docker compose run --rm tests -v
+docker compose run --rm tests -k lorcana
+```
+
+> ⚠️ If the build or the pytest install fails with
+> `SSL: CERTIFICATE_VERIFY_FAILED`, an antivirus or proxy doing HTTPS
+> inspection (e.g. Norton Web/Mail Shield) is intercepting PyPI traffic.
+> Disable its SSL scanning for Docker, or pass its root certificate to pip:
+> `docker compose run --rm -v /path/to/root.pem:/ca.pem:ro -e PIP_CERT=/ca.pem tests`.
+
+### Option B — Local Python
+
+From the project root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows (Git Bash): source .venv/Scripts/activate
+                                   # Windows (PowerShell): .venv\Scripts\Activate.ps1
+pip install -r requirements-dev.txt
+
+python -m pytest
+```
+
+`requirements-dev.txt` installs the runtime dependencies plus pytest, and
+`pytest.ini` already sets the test paths, so no extra flags are required.
+Useful variations:
+
+```bash
+python -m pytest -v                       # one line per test
+python -m pytest tests/test_mtg.py        # a single module
+python -m pytest -k lorcana               # tests matching a keyword
+```
+
+| Module | Covers |
+| --- | --- |
+| `tests/test_exporter.py` | PDF generation: pagination, de-duplication, foil / double-sided split, automatic backs, skipped failures, image reuse |
+| `tests/test_lorcana.py` | LorcanaJSON lookup, default / `[base]` art selection and `lorcana.gg` fallback |
+| `tests/test_mtg.py` | Scryfall collector-number and named lookups, double-faced backs and Moxfield fallback |
+| `tests/test_pokemon.py` | pkmncards.com search, best-match selection and card-page fallback |
+| `tests/test_local.py` | Local image resolution (exact, case-insensitive, with extension, missing files) |
 
 ---
 

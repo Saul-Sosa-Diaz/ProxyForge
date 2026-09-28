@@ -9,3 +9,14 @@ services:
       - ./output:/app/output
       - ./data:/app/data
       - ./src:/app/src
+
+  # Test suite (offline). Only runs on demand: docker compose run --rm tests
+  tests:
+    build: .
+    profiles: ["test"]
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./pytest.ini:/app/pytest.ini
+      - ./requirements-dev.txt:/app/requirements-dev.txt
+    entrypoint: ["sh", "-c", "pip install -q --root-user-action=ignore -r requirements-dev.txt && python -m pytest \"$@\"", "--"]

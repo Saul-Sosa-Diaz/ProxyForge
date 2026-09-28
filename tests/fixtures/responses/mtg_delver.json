@@ -1,0 +1,7 @@
+{
+  "name": "Delver of Secrets // Insectile Aberration",
+  "card_faces": [
+    {"name": "Delver of Secrets", "image_uris": {"png": "https://img.test/delver.png"}},
+    {"name": "Insectile Aberration", "image_uris": {"png": "https://img.test/insectile.png"}}
+  ]
+}
