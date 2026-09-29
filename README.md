@@ -49,7 +49,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
 | 🃏 **Lorcana** | Queries the **LorcanaJSON** API on every run, and falls back to scraping `lorcana.gg`; `[art]` decklist markers select the card art (default: most premium available) |
 | ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
-| 🔮 **Magic: The Gathering** | Queries [MPC Autofill](https://mpcfill.com) first (community full-resolution imagery, by name), then the [Scryfall API](https://scryfall.com/docs/api) live on every run (exact + fuzzy name lookup, collector-number lookup, variant/base art search, high-res `png` imagery) with a search fallback and a final [Moxfield](https://moxfield.com) fallback; `[art]` decklist markers select set / variant / printing (honored by Scryfall, ignored by MPC) |
+| 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) live on every run (exact + fuzzy name lookup, collector-number lookup, variant/base art search, high-res `png` imagery) with a search fallback and a final [Moxfield](https://moxfield.com) fallback; `[art]` decklist markers select set / variant / printing. Lines marked `[mpc:<id>]` (picked in the web art picker) use that [MPC Autofill](https://mpcfill.com) full-resolution community image instead |
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
@@ -180,8 +180,16 @@ before printing:
 3. In the *Front / Back* tabs each front sits on top of its back with the
    same pair number; hovering brings the back forward.
 4. **🎨 Arte** (MTG and Lorcana) opens an art picker with a preview of every
-   available art — every Scryfall printing for MTG (filterable by set or
-   variant), Enchanted / Iconic / Epic / Special / base for Lorcana. Only
+   available art — for MTG every MPC Autofill image first (source, DPI and
+   file size in the label, highest DPI first) and then every Scryfall
+   printing (~300 DPI, saved as `[set:collector]`), filterable by
+   source, DPI, set or variant; Enchanted / Iconic / Epic / Special / base for Lorcana.
+   All arts sit in one scrollable grid that shows up at once; each preview
+   appears as soon as it arrives. The server downloads them (24 in
+   parallel, with retries) because Google Drive throttles browsers that
+   request hundreds of MPC thumbnails at once, and caches them in memory
+   and in `data/thumbnails` (`PROXYFORGE_CACHE_DIR`), so reopening a card
+   is instant even after a restart. Only
    the chosen art is downloaded. **✏️ Editar** changes name, copies or foil,
    or removes the card. **✨ Pasar a foil / 🃏 Pasar a normales** moves a
    card between the regular and foil PDFs in one click (or a whole tab at
@@ -189,10 +197,13 @@ before printing:
 5. **🖨️ Generar PDFs** renders the same PDFs as the CLI. Each tab then offers
    its own PDF(s) for download, and **📦 Descargar todos** bundles them in a
    `.zip` (they are also saved under `output/<tcg>/<deck>/`).
-6. **📝 Descargar decklist (.txt)** exports the deck with every change
-   (art markers, foil, copies) in the input format; it is also saved as
-   `output/<tcg>/<deck>/<deck>.txt` and included in the `.zip`, so the
-   same deck can be rebuilt later from the web UI or the CLI.
+6. **📝 Decklist · original ↔ con tus cambios** shows the decklist you
+   loaded on the left and, on the right, the live decklist with every change
+   (art markers, foil, copies, edits) in the input format, with a count of
+   changed lines and a copy button on each side. The right side is saved to
+   `output/<tcg>/<deck>/<deck>.txt` as soon as it changes (and included in
+   the `.zip`), so the same deck can be rebuilt later from the web UI or the
+   CLI.
 
 ```bash
 # Docker Compose → http://localhost:8501
@@ -217,7 +228,7 @@ quick test prints). Set `PROXYFORGE_OUTPUT_DIR` to change the default output fol
 | `--output` | `-o` | `/app/output` | Base output directory. |
 | `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`, `local`). |
 | `--local-dir` | | `input/images` | Directory with local card images (Local only). Card names in the decklist must match the local file names. |
-| `--mpc-url` | | `https://mpcfill.com` | MPC Autofill backend URL (MTG primary source). |
+| `--mpc-url` | | `https://mpcfill.com` | MPC Autofill backend URL (MTG `[mpc:<id>]` images and art picker). |
 | `--dpi` | | original | Resample every card to this DPI (e.g. `800`, `300` for drafts, high-quality JPEG). By default the PDF embeds the downloaded images as-is: JPEGs byte for byte, PNGs losslessly. |
 | `--verbose` | `-v` | off | Enable verbose logging. |
 
@@ -341,25 +352,35 @@ a set (+collector) + variant combo (the `[art]` set always wins over a
 
 ## 🔮 MTG Lookup (Magic: The Gathering)
 
-The MTG strategy tries **[MPC Autofill](https://mpcfill.com)** first
-(community print-ready imagery, searched by card name only — decklist set
-annotations and `[art]` markers are ignored here; DFC backs resolve via
-`GET /2/DFCPairs/`), then resolves live through the **Scryfall API**
-(`https://api.scryfall.com`) — nothing is cached on disk:
+The MTG strategy resolves cards live through the **Scryfall API**
+(`https://api.scryfall.com`) — nothing is cached on disk. **[MPC Autofill](https://mpcfill.com)**
+(community print-ready scans, often 1200 DPI) is used **only for decklist
+lines that carry an `[mpc:<identifier>]` marker**, normally chosen in the web
+art picker (🎨 Arte lists every MPC image of the card with its source, DPI
+and size, then the Scryfall printings):
 
-> **Reproducible MPC images.** The MPC search ranks its hits by the order
-> of the server's sources, which changes as the community adds images, so
-> the "first hit" of a name may differ between runs. Every export therefore
-> writes `output/<tcg>/<deck>/<deck>.txt` with each MPC hit pinned as
-> `[mpc:<identifier>]` (double-faced backs become an explicit
-> `/ Back [mpc:<identifier>]`). Feed that file back as `--input` and the
-> exact same images are requested (`POST /2/cards/` by identifier, no
-> search). A pinned image that was removed from MPC falls back to the
-> name search.
->
 > ```text
-> 1 Delver of Secrets [mpc:1k4w07AFcKua0ldRpmTgXx0pTsEGv4kxg] / Insectile Aberration [mpc:<identifier>]
+> 1 Demonic Tutor (SLD) 1856 [mpc:1tJPmfGBt0Ria_updjEwkfkQZtNMkUoXF]   <- MPC, that exact image
+> 1 Chaos Emerald (SLD) 7037 [sld:7031]                                <- Scryfall
+> 1 Ororo Borealis (SLD) 1746                                          <- Scryfall
 > ```
+>
+> The identifier is the image's Google Drive id, so the same image is
+> downloaded on every run (`POST /2/cards/`). An MPC image that was removed
+> falls back to Scryfall. The automatic back of an MPC double-faced front
+> comes from MPC too (`GET /2/DFCPairs/`, highest-DPI hit) and is written
+> into the saved decklist as `/ Back [mpc:<identifier>]`.
+>
+> mpcfill.com sits behind Cloudflare, which answers bursts (~10 calls in a
+> few seconds) with HTTP 429. The strategy fetches a deck's MPC images in
+> batches before downloading (`/2/cards/` 1000 at a time), spaces MPC calls
+> 1.5 s apart, waits for `Retry-After` on a 429 and never caches a failed
+> lookup. Each downloaded card is logged with its source and quality
+> (`Card 'X' -> MPC Autofill 'X' (1200 DPI · 3.8 MB · MrTeferi)` or
+> `-> Scryfall (png, ~300 DPI)`), and the web UI shows the print DPI of
+> every card (⚠️ below 600 DPI).
+
+Lines without an MPC marker follow the Scryfall chain:
 
 1. `GET /cards/<set>/<collector>` — exact printing when the decklist pins
    one (`Lightning Bolt (2x2) 117`) or the `[art]` marker does (`[2x2:117]`).
@@ -383,10 +404,9 @@ annotations and `[art]` markers are ignored here; DFC backs resolve via
    the same URL served by the "Download Image" button on
    `moxfield.com/cards/<id>-<name>` pages.
 
-Images are downloaded from MPC Autofill at full resolution (the first
-community hit's Google Drive `downloadLink`, often 1200 DPI scans that the
-PDF embeds untouched).
-Scryfall fallbacks use its image CDN in the highest-quality
+MPC images are downloaded at full resolution (the chosen image's Google
+Drive `downloadLink`, often 1200 DPI scans that the PDF embeds untouched).
+Scryfall images use its image CDN in the highest-quality
 `png` version (744 x 1040, transparent rounded corners); the remaining
 versions (`large`, `normal`, `border_crop`, `small`) act as fallbacks.
 Double-faced cards (transform, modal DFC...) resolve both faces from a
@@ -474,7 +494,7 @@ python src/main.py --input input/my_deck.txt --output output --tcg local \
 | Page size | A4 (210 x 297 mm) |
 | Grid | 3 x 3 (9 cards per page) |
 | Gutter | 3 mm |
-| Bleed | 1 mm fixed (mirrored edge) |
+| Bleed | 1 mm fixed: the image's own bleed when it has one (MPC Autofill print files, ~3 mm, trimmed so the card area is exactly 63 x 88 mm), otherwise a mirrored edge |
 
 ---
 
@@ -534,7 +554,7 @@ python -m pytest -k lorcana               # tests matching a keyword
 | `tests/test_exporter.py` | PDF generation: pagination, de-duplication, foil / double-sided split, automatic backs, skipped failures, image reuse |
 | `tests/test_pdf.py` | Vector PDF writer: JPEG / PNG pass-through, lossless conversion, resampling, xref table |
 | `tests/test_lorcana.py` | LorcanaJSON lookup, default / `[base]` art selection and `lorcana.gg` fallback |
-| `tests/test_mtg.py` | MPC Autofill primary source, Scryfall collector-number and named lookups, double-faced backs and Moxfield fallback |
+| `tests/test_mtg.py` | MPC Autofill `[mpc:<id>]` images and rate limits, Scryfall collector-number and named lookups, double-faced backs and Moxfield fallback |
 | `tests/test_pokemon.py` | pkmncards.com search, best-match selection and card-page fallback |
 | `tests/test_local.py` | Local image resolution (exact, case-insensitive, with extension, missing files) |
 

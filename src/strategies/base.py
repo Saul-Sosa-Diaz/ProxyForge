@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 
-from ..models import ArtOption
+from ..models import ArtOption, DeckCard
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,17 @@ class TCGStrategy(ABC):
             otherwise ``False`` (single-faced card or unresolvable back).
         """
         return False
+
+    def prefetch(self, cards: list[DeckCard]) -> None:
+        """Warm the strategy's caches for a whole deck before it is resolved.
+
+        Called once by the exporter before the per-card fetches so sources
+        with batch endpoints (e.g. MPC Autofill) can look many cards up in
+        a few requests. The default does nothing. Must not raise.
+
+        Args:
+            cards: Decklist entries about to be resolved.
+        """
 
     def pin_art(self, card_name: str, art: str | None = None) -> str | None:
         """Turn an ``[art]`` request into the marker of the exact image it yields.

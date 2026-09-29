@@ -53,5 +53,16 @@ def test_mpc_marker_keeps_identifier_case():
     assert format_deck([card]) == text.replace("MPC:", "mpc:")
 
 
+def test_scryfall_marker_wraps_an_mtg_art():
+    cards = parse_deck_text(
+        "1 Sol Ring [scryfall:sld 1512★]\n"
+        "1 Bolt [Scryfall:m21 borderless]\n"
+        "1 X [scryfall:nonsense words]\n"
+    )
+
+    assert [c.art for c in cards] == ["scryfall:sld:1512★", "scryfall:m21 borderless", None]
+    assert cards[2].name == "X [scryfall:nonsense words]"
+
+
 def test_format_deck_line_minimal():
     assert format_deck_line(DeckCard(quantity=2, name="Island")) == "2 Island"

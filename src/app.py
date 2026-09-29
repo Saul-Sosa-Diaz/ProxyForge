@@ -14,17 +14,23 @@ PDFs are rendered.
 from __future__ import annotations
 
 import base64
+import difflib
 import functools
+import hashlib
 import io
 import logging
 import os
 import re
 import sys
+import threading
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+import requests
 import streamlit as st
 from PIL import Image
 
@@ -33,7 +39,7 @@ from PIL import Image
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.exporter import PRINT_DPI, Exporter
+from src.exporter import PRINT_DPI, Exporter, estimate_print_dpi
 from src.main import _STRATEGY_REGISTRY, _make_strategy
 from src.models import ArtOption, DeckCard, ResolvedCard
 from src.parser import format_deck, parse_deck_text
@@ -46,10 +52,26 @@ DEFAULT_OUTPUT_DIR = os.environ.get("PROXYFORGE_OUTPUT_DIR", "output")
 DEFAULT_DECK_NAME = "mazo"
 # None = original images (maximum quality); a DPI resamples to smaller files.
 DPI_OPTIONS = (None, PRINT_DPI, 600, 300)
+# Card images below this resolution get a warning badge (Scryfall scans ~300).
+GOOD_PRINT_DPI = 600
 GRID_COLUMNS = 4
 ART_GRID_COLUMNS = 4
-ART_OPTIONS_PER_PAGE = 12
+# Height (px) of the scrollable art-picker grid.
+ART_GRID_HEIGHT = 640
 THUMBNAIL_SIZE = (360, 504)
+# Height (px) of each side of the original / current decklist comparison.
+DECKLIST_HEIGHT = 320
+# Art-picker previews are fetched by the server (Google Drive rejects bursts
+# of browser requests), in parallel, with retries, and cached in memory and
+# on disk. Drive takes ~1 s to render each thumbnail whatever its size, so
+# parallelism is what matters: 32 workers stayed free of HTTP 429 in tests.
+ART_THUMBNAIL_SIZE = (240, 336)
+ART_THUMBNAIL_WORKERS = 24
+ART_THUMBNAIL_CACHE_DIR = Path(os.environ.get("PROXYFORGE_CACHE_DIR", "data")) / "thumbnails"
+ART_THUMBNAIL_RETRIES = 3
+ART_THUMBNAIL_TIMEOUT = 20
+# Scryfall's image CDN rejects the default python-requests User-Agent (HTTP 400).
+ART_THUMBNAIL_HEADERS = {"User-Agent": "tgc-card-image-downloader/1.0", "Accept": "image/*"}
 
 TCG_LABELS = {
     "local": "Imágenes locales",
@@ -137,6 +159,109 @@ def _thumbnail(path: str, mtime: float) -> bytes:
 
 def _thumbnail_of(path: Path) -> bytes:
     return _thumbnail(str(path), path.stat().st_mtime)
+
+
+@st.cache_resource
+def _art_thumbnail_store() -> tuple[dict[str, bytes | None], threading.Lock]:
+    """Process-wide cache of art-picker previews (``None`` = unavailable)."""
+    return {}, threading.Lock()
+
+
+def _cached_art_thumbnail(url: str) -> tuple[bool, bytes | None]:
+    """``(found, preview)`` from the memory or disk cache, without fetching."""
+    store, lock = _art_thumbnail_store()
+    with lock:
+        if url in store:
+            return True, store[url]
+    path = _art_thumbnail_path(url)
+    if path is not None and path.exists():
+        data = path.read_bytes()
+        with lock:
+            store[url] = data
+        return True, data
+    return False, None
+
+
+def _load_art_thumbnail(url: str) -> bytes | None:
+    """Fetch one preview and cache it (failures only in memory, to retry later)."""
+    data = _fetch_art_thumbnail(url)
+    store, lock = _art_thumbnail_store()
+    with lock:
+        store[url] = data
+    path = _art_thumbnail_path(url)
+    if data is not None and path is not None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        except OSError as exc:
+            logger.debug("Could not cache preview %s: %s", url, exc)
+    return data
+
+
+def _art_thumbnail_path(url: str) -> Path | None:
+    """Disk cache file of a remote preview (local files are not cached)."""
+    if not url.startswith(("http://", "https://")):
+        return None
+    return ART_THUMBNAIL_CACHE_DIR / f"{hashlib.sha1(url.encode()).hexdigest()}.jpg"
+
+
+def _show_art_preview(slot, preview: bytes | None) -> None:
+    if preview is not None:
+        slot.image(preview)
+    else:
+        slot.caption("🖼️ Vista previa no disponible")
+
+
+def _stream_art_thumbnails(pending: dict[str, list]) -> None:
+    """Fill each placeholder as soon as its preview arrives (grid order first).
+
+    A click on the grid reruns the script mid-way: the pool is then shut
+    down without waiting, and downloads already running still land in the
+    cache for the next run.
+    """
+    pool = ThreadPoolExecutor(ART_THUMBNAIL_WORKERS)
+    try:
+        futures = {pool.submit(_load_art_thumbnail, url): slots for url, slots in pending.items()}
+        for future in as_completed(futures):
+            for slot in futures[future]:
+                _show_art_preview(slot, future.result())
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _fetch_art_thumbnail(url: str) -> bytes | None:
+    """Download (or read) one preview and shrink it to a small JPEG."""
+    if url.startswith(("http://", "https://")):
+        data = None
+        for attempt in range(ART_THUMBNAIL_RETRIES):
+            try:
+                resp = requests.get(
+                    url, timeout=ART_THUMBNAIL_TIMEOUT, headers=ART_THUMBNAIL_HEADERS
+                )
+            except requests.RequestException as exc:
+                logger.debug("Preview %s failed: %s", url, exc)
+            else:
+                if resp.status_code == 200:
+                    data = resp.content
+                    break
+                logger.debug("Preview %s returned HTTP %s", url, resp.status_code)
+                if resp.status_code != 429 and resp.status_code < 500:
+                    break  # permanent (e.g. 400/404): retrying will not help
+            time.sleep(0.5 * 2**attempt)  # back off: Drive answers bursts with 429
+        if data is None:
+            return None
+        source: io.BytesIO | str = io.BytesIO(data)
+    else:
+        source = url
+    try:
+        with Image.open(source) as img:
+            img = img.convert("RGB")
+            img.thumbnail(ART_THUMBNAIL_SIZE)
+            buffer = io.BytesIO()
+            img.save(buffer, "JPEG", quality=85)
+    except OSError:
+        return None
+    return buffer.getvalue()
 
 
 def _data_uri(path: Path) -> str:
@@ -276,7 +401,9 @@ def _render_deck_input(ctx: _Context) -> None:
         return
     finally:
         progress.empty()
-    st.session_state.update(resolved=resolved, deck_name=deck_name, context=ctx, pdfs=[])
+    st.session_state.update(
+        resolved=resolved, deck_name=deck_name, context=ctx, pdfs=[], deck_text=text
+    )
     _close_art_dialog()
 
 
@@ -307,6 +434,11 @@ def _render_card(
         badges.append(f"🎨 `{card.art}`")
     if card.foil:
         badges.append("✨ foil")
+    if item.front_path is not None:
+        dpi = estimate_print_dpi(item.front_path)
+        if dpi is not None:
+            icon = "🖼️" if dpi >= GOOD_PRINT_DPI else "⚠️"
+            badges.append(f"{icon} {dpi} DPI")
 
     if item.front_path is None:
         st.error(f"No encontrada: **{card.name}**")
@@ -405,6 +537,11 @@ def _art_dialog(index: int) -> None:
     )
     if card.art and info_col.button("↩️ Volver al arte por defecto"):
         _choose_art(index, item, ctx, deck_name, None)
+    if info_col.button(
+        "🔄 Recargar artes",
+        help="Vuelve a consultar las fuentes (p. ej. si MPC Autofill no respondió).",
+    ):
+        st.session_state.get("art_options", {}).pop((ctx.tcg, card.name), None)
 
     with st.spinner("Buscando artes disponibles…"):
         options = _art_options(ctx, card.name)
@@ -412,21 +549,28 @@ def _art_dialog(index: int) -> None:
         st.info("No hay artes alternativos para esta carta.")
         return
 
-    query = st.text_input("Filtrar", placeholder="Set, código, variante…").strip().lower()
+    query = st.text_input(
+        "Filtrar", placeholder="Fuente, DPI, set, variante…"
+    ).strip().lower()
     if query:
-        options = [o for o in options if query in o.label.lower() or query in o.value]
-    pages = max(1, -(-len(options) // ART_OPTIONS_PER_PAGE))
-    page = 1
-    if pages > 1:
-        page = int(st.number_input(f"Página (de {pages})", 1, pages, 1))
+        options = [o for o in options if query in o.label.lower() or query in o.value.lower()]
     st.caption(f"{len(options)} artes")
-    start = (page - 1) * ART_OPTIONS_PER_PAGE
-    visible = options[start : start + ART_OPTIONS_PER_PAGE]
-    for row_start in range(0, len(visible), ART_GRID_COLUMNS):
-        columns = st.columns(ART_GRID_COLUMNS)
-        for column, option in zip(columns, visible[row_start : row_start + ART_GRID_COLUMNS]):
+    # The grid is drawn at once with a placeholder per preview; missing
+    # previews are then streamed into their placeholders as they arrive.
+    pending: dict[str, list] = {}
+    grid = st.container(height=ART_GRID_HEIGHT, border=False)
+    for row_start in range(0, len(options), ART_GRID_COLUMNS):
+        columns = grid.columns(ART_GRID_COLUMNS)
+        for column, option in zip(columns, options[row_start : row_start + ART_GRID_COLUMNS]):
             with column:
-                st.image(option.image_url, caption=option.label)
+                slot = st.empty()
+                found, preview = _cached_art_thumbnail(option.image_url)
+                if found:
+                    _show_art_preview(slot, preview)
+                else:
+                    slot.caption("⏳ Cargando vista previa…")
+                    pending.setdefault(option.image_url, []).append(slot)
+                st.caption(option.label)
                 selected = option.value == card.art
                 if st.button(
                     "✔️ Seleccionado" if selected else "Usar este arte",
@@ -435,6 +579,8 @@ def _art_dialog(index: int) -> None:
                     disabled=selected,
                 ):
                     _choose_art(index, item, ctx, deck_name, option.value)
+    if pending:
+        _stream_art_thumbnails(pending)
 
 
 def _choose_art(
@@ -501,6 +647,7 @@ def _render_preview(current: _Context, dpi: int | None) -> None:
     metrics[3].metric("No encontradas", len(failed))
 
     _render_pdf_actions(dpi, has_cards=bool(found))
+    _render_decklist(resolved, ctx, deck_name)
 
     groups = [
         (group, [(i, r) for i, r in enumerate(resolved) if group.matches(r)])
@@ -551,29 +698,17 @@ def _render_pdf_actions(dpi: int | None, has_cards: bool) -> None:
     ctx: _Context = st.session_state.context
     deck_name: str = st.session_state.deck_name
 
-    decklist = format_deck(item.card for item in resolved)
-    generate_col, txt_col, zip_col = st.columns(3)
+    generate_col, zip_col = st.columns(2)
     if generate_col.button("🖨️ Generar PDFs", type="primary", disabled=not has_cards):
         try:
             quality = "calidad original" if dpi is None else f"{dpi} DPI"
             with st.spinner(f"Generando PDFs ({quality})…"):
                 pdfs = _get_exporter(ctx, dpi).render_pdfs(deck_name, resolved)
-            decklist_file = pdfs[0].parent / f"{deck_name}.txt"
-            decklist_file.write_text(decklist, encoding="utf-8")
-            st.session_state.pdfs = pdfs + [decklist_file]
+            st.session_state.pdfs = pdfs + [_save_decklist(resolved, ctx, deck_name)]
         except Exception as exc:  # noqa: BLE001 - surface any failure in the UI
             logger.exception("PDF rendering failed")
             st.error(f"Error al generar el PDF: {exc}")
 
-    txt_col.download_button(
-        "📝 Descargar decklist (.txt)",
-        data=decklist,
-        file_name=f"{deck_name}.txt",
-        mime="text/plain",
-        key="download-decklist",
-        on_click="ignore",
-        help="El mazo con tus cambios (arte, foil, copias) para regenerarlo en la web o la CLI.",
-    )
     generated: list[Path] = st.session_state.get("pdfs", [])
     if generated:
         zip_col.download_button(
@@ -588,6 +723,63 @@ def _render_pdf_actions(dpi: int | None, has_cards: bool) -> None:
             f"PDFs y decklist generados en `{generated[0].parent}`. "
             "Descárgalos desde cada pestaña o todos juntos."
         )
+
+
+def _save_decklist(resolved: list[ResolvedCard], ctx: _Context, deck_name: str) -> Path:
+    """Write ``<output>/<tcg>/<deck>/<deck>.txt`` when its contents changed."""
+    path = Path(ctx.output_dir) / ctx.tcg / deck_name / f"{deck_name}.txt"
+    text = format_deck(item.card for item in resolved)
+    try:
+        unchanged = path.read_text(encoding="utf-8") == text
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _changed_lines(original: str, current: str) -> int:
+    """Entries added or modified in ``current`` (formatting-only edits ignored)."""
+    try:
+        before = format_deck(parse_deck_text(original)).splitlines()
+    except ValueError:
+        before = original.splitlines()
+    diff = difflib.ndiff(before, current.splitlines())
+    return sum(1 for line in diff if line.startswith("+ "))
+
+
+def _render_decklist(resolved: list[ResolvedCard], ctx: _Context, deck_name: str) -> None:
+    """Original decklist next to the live one, saved to disk on every change.
+
+    The right side is rebuilt from the current cards on each rerun (art
+    choices, foil moves, copies, edits), so it always matches what the
+    PDFs will contain and can be fed back to the web UI or the CLI.
+    """
+    original: str = st.session_state.get("deck_text", "")
+    current = format_deck(item.card for item in resolved)
+    try:
+        path = _save_decklist(resolved, ctx, deck_name)
+    except OSError as exc:
+        logger.warning("Could not save the decklist: %s", exc)
+        path = None
+    changed = _changed_lines(original, current)
+
+    with st.expander("📝 Decklist · original ↔ con tus cambios", expanded=True):
+        left, right = st.columns(2)
+        with left:
+            st.caption("Original")
+            st.code(original.strip() or "(vacía)", language=None, height=DECKLIST_HEIGHT)
+        with right:
+            summary = (
+                "sin cambios" if not changed
+                else "1 línea cambiada" if changed == 1
+                else f"{changed} líneas cambiadas"
+            )
+            st.caption(f"Con tus cambios · {summary}")
+            st.code(current.strip(), language=None, height=DECKLIST_HEIGHT)
+        if path is not None:
+            st.caption(f"Se guarda automáticamente en `{path}`.")
 
 
 def main() -> None:

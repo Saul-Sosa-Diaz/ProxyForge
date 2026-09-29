@@ -8,6 +8,8 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import NamedTuple
 
+from PIL import Image
+
 from .models import DeckCard, ResolvedCard
 from .parser import format_deck
 from .pdf import PdfWriter, draw_image_ops, line_ops
@@ -28,6 +30,9 @@ MM_PER_INCH = 25.4
 POINTS_PER_INCH = 72.0
 # How far bleed strips reach under the card so no hairline shows between them.
 _BLEED_OVERLAP_PT = 0.5
+# Bleed per side (mm) accepted as part of a downloaded image (MPC Autofill
+# print files carry ~3 mm); anything else is treated as a plain card scan.
+SOURCE_BLEED_RANGE_MM = (1.0, 6.0)
 
 # Professional cut geometry: gutter between cards, mirrored-edge bleed and
 # trim (crop) marks placed in the outer margins of the sheet.
@@ -147,6 +152,8 @@ class Exporter:
         """
         images_dir = self.output_base / deck_name / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
+        # Let the strategy batch its lookups (e.g. one MPC search per deck).
+        self.strategy.prefetch(cards)
         unique: dict[str, Path] = {}
         resolved: list[ResolvedCard] = []
         for index, card in enumerate(cards):
@@ -439,13 +446,17 @@ class Exporter:
             start_y=(page_h - block_h) / 2,
         )
 
-    def _image_size(self) -> tuple[int, int] | None:
-        """Pixel size cards are resampled to (``None`` = source pixels)."""
+    def _image_size(self, source_bleed_mm: float) -> tuple[int, int] | None:
+        """Pixel size cards are resampled to (``None`` = source pixels).
+
+        Covers the whole image, source bleed included, so resampling keeps
+        the aspect ratio.
+        """
         if self.target_dpi is None:
             return None
         return (
-            round(CARD_WIDTH_MM * self.target_dpi / MM_PER_INCH),
-            round(CARD_HEIGHT_MM * self.target_dpi / MM_PER_INCH),
+            round((CARD_WIDTH_MM + 2 * source_bleed_mm) * self.target_dpi / MM_PER_INCH),
+            round((CARD_HEIGHT_MM + 2 * source_bleed_mm) * self.target_dpi / MM_PER_INCH),
         )
 
     def _build_pdf(
@@ -566,37 +577,50 @@ class Exporter:
     ) -> str:
         """Operators placing one card in grid slot ``(col, row)`` with bleed.
 
-        The card image is stretched to exactly 63x88 mm at its source
-        resolution (the printer does the only resampling). The bleed strip
-        that extends ``bleed`` into the gutter redraws the same image
-        mirrored around each card edge and clipped to the strip, so the
-        trim line (where the crop marks point) coincides exactly with the
-        visible card edge.
+        The card area of the image fills exactly 63x88 mm at its source
+        resolution (the printer does the only resampling). Images that
+        already carry a print bleed (e.g. MPC Autofill scans, ~3 mm per
+        side, see :func:`_source_bleed_mm`) are placed so that bleed falls
+        outside the trim line and clipped to ``bleed`` into the gutter, so
+        the real artwork fills it. Otherwise the bleed strip redraws the
+        image mirrored around each card edge. Either way the trim line
+        (where the crop marks point) coincides exactly with the visible
+        card edge.
         """
-        name = writer.add_image(slot_path, self._image_size())
+        source_bleed_mm = _source_bleed_mm(slot_path)
+        name = writer.add_image(slot_path, self._image_size(source_bleed_mm))
         w, h, b = geo.card_w, geo.card_h, geo.bleed
+        s = _mm_to_pt(source_bleed_mm)
         x = geo.start_x + col * (w + geo.gap)
         # PDF user space starts at the bottom-left corner of the page.
         y = geo.page_h - (geo.start_y + row * (h + geo.gap)) - h
+        # The whole image (card + source bleed) spans iw x ih points.
+        iw, ih = w + 2 * s, h + 2 * s
+        if s >= b:
+            return draw_image_ops(name, (iw, 0, 0, ih, x - s, y - s), (x - b, y - b, w + 2 * b, h + 2 * b))
         ops: list[str] = []
         if b > 0:
             # Strips reach _BLEED_OVERLAP_PT under the card so no hairline
             # gap shows between them; the card itself is drawn on top.
+            # Mirroring around an edge at c maps the image origin to 2c - origin.
             o = _BLEED_OVERLAP_PT
+            left, right = x + s, x + 2 * w + s
+            bottom, top = y + s, y + 2 * h + s
             strips = (
                 # (clip x, clip y, clip w, clip h), (a, d, e, f) of [a 0 0 d e f]
-                ((x - b, y, b + o, h), (-w, h, x, y)),  # left, mirrored X
-                ((x + w - o, y, b + o, h), (-w, h, x + 2 * w, y)),  # right
-                ((x, y - b, w, b + o), (w, -h, x, y)),  # bottom, mirrored Y
-                ((x, y + h - o, w, b + o), (w, -h, x, y + 2 * h)),  # top
-                ((x - b, y - b, b + o, b + o), (-w, -h, x, y)),  # corners: both
-                ((x + w - o, y - b, b + o, b + o), (-w, -h, x + 2 * w, y)),
-                ((x - b, y + h - o, b + o, b + o), (-w, -h, x, y + 2 * h)),
-                ((x + w - o, y + h - o, b + o, b + o), (-w, -h, x + 2 * w, y + 2 * h)),
+                ((x - b, y, b + o, h), (-iw, ih, left, y - s)),  # left, mirrored X
+                ((x + w - o, y, b + o, h), (-iw, ih, right, y - s)),  # right
+                ((x, y - b, w, b + o), (iw, -ih, x - s, bottom)),  # bottom, mirrored Y
+                ((x, y + h - o, w, b + o), (iw, -ih, x - s, top)),  # top
+                ((x - b, y - b, b + o, b + o), (-iw, -ih, left, bottom)),  # corners: both
+                ((x + w - o, y - b, b + o, b + o), (-iw, -ih, right, bottom)),
+                ((x - b, y + h - o, b + o, b + o), (-iw, -ih, left, top)),
+                ((x + w - o, y + h - o, b + o, b + o), (-iw, -ih, right, top)),
             )
             for clip, (a, d, e, f) in strips:
                 ops.append(draw_image_ops(name, (a, 0, 0, d, e, f), clip))
-        ops.append(draw_image_ops(name, (w, 0, 0, h, x, y)))
+        card_clip = (x, y, w, h) if s > 0 else None
+        ops.append(draw_image_ops(name, (iw, 0, 0, ih, x - s, y - s), card_clip))
         return "\n".join(ops)
 
     def _crop_mark_ops(self, geo: _Geometry) -> str:
@@ -663,6 +687,44 @@ class _Geometry(NamedTuple):
 # ----------------------------------------------------------------------
 def _mm_to_pt(value_mm: float) -> float:
     return value_mm * POINTS_PER_INCH / MM_PER_INCH
+
+
+def estimate_print_dpi(image_path: Path) -> int | None:
+    """Resolution a card image prints at on a 63x88 mm card (``None`` if unreadable).
+
+    Accounts for a source bleed (see :func:`_source_bleed_mm`), so an MPC
+    Autofill file reports its real scan DPI.
+    """
+    try:
+        with Image.open(image_path) as image:
+            width = image.width
+    except OSError:
+        return None
+    width_mm = CARD_WIDTH_MM + 2 * _source_bleed_mm(image_path)
+    return round(width * MM_PER_INCH / width_mm)
+
+
+def _source_bleed_mm(image_path: Path) -> float:
+    """Print bleed (mm per side) already included in a card image.
+
+    Models the image as ``(63 + 2b) x (88 + 2b)`` mm at an unknown DPI: the
+    height minus the width is always 25 mm, which gives the DPI and then
+    ``b``. Plain card scans (Scryfall, Lorcana...) yield ``b`` of about 0;
+    MPC Autofill print files carry ~3 mm. Values outside
+    ``SOURCE_BLEED_RANGE_MM`` are treated as no bleed (the image is then
+    stretched to the card size as-is). Only the header is read.
+    """
+    try:
+        with Image.open(image_path) as image:
+            width, height = image.size
+    except OSError:
+        return 0.0
+    px_per_mm = (height - width) / (CARD_HEIGHT_MM - CARD_WIDTH_MM)
+    if px_per_mm <= 0:
+        return 0.0
+    bleed = (width / px_per_mm - CARD_WIDTH_MM) / 2
+    low, high = SOURCE_BLEED_RANGE_MM
+    return bleed if low <= bleed <= high else 0.0
 
 
 def _sanitize_filename(name: str) -> str:

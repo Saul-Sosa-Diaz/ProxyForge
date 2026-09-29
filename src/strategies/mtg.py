@@ -1,14 +1,14 @@
 """MTG image-fetching strategy.
 
-Resolution order (MPC Autofill, https://mpcfill.com, then Scryfall API,
+Resolution order (MPC Autofill, https://mpcfill.com, only for explicit
+``[mpc:<identifier>]`` markers; otherwise Scryfall API,
 https://scryfall.com/docs/api, then Moxfield, https://moxfield.com):
-    1. MPC Autofill community database (``POST /2/editorSearch/`` plus
-       ``POST /2/cards/``): searched by card name only — decklist set
-       annotations and ``[art]`` markers are ignored here and the first
-       hit's full-resolution ``downloadLink`` is used. A pinned
-       ``[mpc:<identifier>]`` marker skips the search and fetches that
-       exact image (``pin_art`` produces it so the exporter can write a
-       decklist that reproduces the same images on later runs).
+    1. MPC Autofill community database (``POST /2/cards/``) when the
+       decklist line carries ``[mpc:<identifier>]`` (picked in the web art
+       picker, which lists every MPC image of a card via
+       ``POST /2/editorSearch/``): that exact full-resolution image. Lines
+       without an MPC marker never touch MPC; an MPC image that was removed
+       falls back to Scryfall.
     2. Scryfall collector lookup (``GET /cards/<set>/<collector>``) when the
        decklist pins an exact printing (``Lightning Bolt (2x2) 117`` or the
        ``[2x2:117]`` art marker).
@@ -41,16 +41,16 @@ Art selection (per-card ``[art]`` decklist marker, like Lorcana):
 ``[2x2:117 showcase]``). Cards without a marker use Scryfall's default
 printing.
 
-Images are served at full resolution by the MPC Autofill database (the
-Google Drive ``downloadLink`` of the first community hit, ideal for the
-800 DPI print). Scryfall fallbacks use its image CDN
+MPC images are served at full resolution from the Google Drive
+``downloadLink`` of the chosen community image (often 1200 DPI scans).
+Scryfall images use its image CDN
 (``cards.scryfall.io``) in the versions documented at
 https://scryfall.com/docs/api/images. By default the ``png`` version is
 used (744x1040, highest quality); the remaining versions (``large``,
 ``normal``, ``border_crop``, ``small``...) serve as fallbacks.
 
-Double-faced cards (transform, modal DFC...): MPC backs resolve via
-``GET /2/DFCPairs/`` while Scryfall backs use ``card_faces[1]``, so a
+Double-faced cards (transform, modal DFC...): backs of MPC fronts resolve
+via ``GET /2/DFCPairs/`` while Scryfall backs use ``card_faces[1]``, so a
 single decklist line prints both sides without naming the back
 explicitly. ``fetch_card_image`` saves the front face while
 ``fetch_card_back_image`` saves the back face. Split / flip / adventure
@@ -72,7 +72,7 @@ from typing import Any
 
 import requests
 
-from ..models import ArtOption
+from ..models import ArtOption, DeckCard
 from .base import TCGStrategy
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,10 @@ MTG_VARIANT_CHOICES = ("fullart", "borderless", "showcase", "extended", "retro",
 MTG_ART_MODES = ("best", "base")
 # '[mpc:<identifier>]' pins one MPC Autofill image (case-sensitive id).
 MPC_ART_PREFIX = "mpc:"
+# Legacy '[scryfall:<art>]' marker (Scryfall is now the default): same as '[<art>]'.
+SCRYFALL_ART_PREFIX = "scryfall:"
+# MPC images that stand in for a card rather than show it.
+_MPC_STAND_IN = re.compile(r"\b(checklist|placeholder)\b", re.IGNORECASE)
 
 
 class MTGStrategy(TCGStrategy):
@@ -104,6 +108,16 @@ class MTGStrategy(TCGStrategy):
     MPC_EDITOR_SEARCH_ENDPOINT = "/2/editorSearch/"
     MPC_CARDS_ENDPOINT = "/2/cards/"
     MPC_DFC_PAIRS_ENDPOINT = "/2/DFCPairs/"
+    # Card documents per ``POST /2/cards/`` call (the server rejects 3000).
+    MPC_CARDS_BATCH_SIZE = 1000
+    # Names per ``POST /2/editorSearch/`` call (a 112-card deck fits in one).
+    MPC_SEARCH_BATCH_SIZE = 100
+    # mpcfill.com (Cloudflare) answers ~10 calls in a few seconds with HTTP
+    # 429 + Retry-After: 10; one call every 1.5 s stays clear of it.
+    MPC_DEFAULT_MIN_REQUEST_INTERVAL = 1.5
+    MPC_RATE_LIMIT_RETRIES = 3
+    MPC_RATE_LIMIT_RETRY_SECONDS = 10.0
+    MPC_MAX_RETRY_SECONDS = 60.0
     DEFAULT_TIMEOUT = 30
     # Scryfall limits /cards/* to 2 requests/second (500 ms between calls).
     DEFAULT_MIN_REQUEST_INTERVAL = 0.5
@@ -118,6 +132,7 @@ class MTGStrategy(TCGStrategy):
         image_format: str = "png",
         min_request_interval: float = DEFAULT_MIN_REQUEST_INTERVAL,
         mpc_url: str | None = None,
+        mpc_min_request_interval: float = MPC_DEFAULT_MIN_REQUEST_INTERVAL,
     ) -> None:
         self.api_url = (api_url or self.SCRYFALL_API_URL).rstrip("/")
         self.mpc_url = (mpc_url or self.MPC_DEFAULT_URL).rstrip("/")
@@ -125,14 +140,16 @@ class MTGStrategy(TCGStrategy):
         self.image_format = image_format
         self.min_request_interval = max(0.0, min_request_interval)
         self._last_request_at = 0.0
+        self.mpc_min_request_interval = max(0.0, mpc_min_request_interval)
+        self._mpc_last_request_at = 0.0
         # Resolved Scryfall card objects, keyed by (normalized name,
         # effective art): shared by the front and back fetches so a
         # double-faced card costs no extra API calls for its back face.
         self._card_cache: dict[tuple[str, str | None], dict[str, Any] | None] = {}
         # MPC Autofill caches, keyed by normalized name / identifier. The
-        # sources list and the DFC pairs are fetched once per run.
+        # sources list and the DFC pairs are fetched once per run. Only
+        # successful responses are cached (a rate-limited call retries).
         self._mpc_sources_cache: list[list[Any]] | None = None
-        self._mpc_sources_loaded = False
         self._mpc_search_cache: dict[str, list[str]] = {}
         self._mpc_card_cache: dict[str, dict[str, Any] | None] = {}
         self._mpc_dfc_pairs: dict[str, str] | None = None
@@ -154,38 +171,27 @@ class MTGStrategy(TCGStrategy):
         output_path: str,
         art: str | None = None,
     ) -> bool:
-        clean_name, _, _ = _parse_card_reference(card_name)
-        # 0. Pinned MPC Autofill image ('[mpc:<identifier>]'): always the
-        # same card document, whatever the search ranking is today.
+        # 1. MPC Autofill only for an explicit '[mpc:<identifier>]' marker
+        # (chosen in the web art picker): always that exact image.
         identifier = _mpc_identifier(art)
         if identifier is not None:
-            pinned_url = self._lookup_mpc_pinned_image(identifier)
+            card = self._mpc_card(identifier)
+            pinned_url = self._mpc_image_url(card) if card is not None else None
             if pinned_url:
-                logger.debug("Card '%s' resolved via pinned MPC card '%s'", card_name, identifier)
+                _log_mpc_choice(card_name, card)
                 return self._download_image(pinned_url, output_path)
             logger.warning(
-                "Pinned MPC Autofill card '%s' for '%s' is unavailable; searching by name.",
+                "MPC Autofill card '%s' for '%s' is unavailable; using Scryfall.",
                 identifier,
                 card_name,
             )
             art = None
-        art = _effective_art(card_name, art)
-        # 1. MPC Autofill primary source (name only; art markers are
-        # honored by the Scryfall fallback below).
-        if art is not None:
-            logger.debug(
-                "Ignoring art marker '[%s]' on card '%s' for the MPC Autofill lookup",
-                art,
-                card_name,
-            )
-        mpc_image_url = self._lookup_mpc_image(clean_name)
-        if mpc_image_url:
-            logger.debug("Card '%s' resolved via MPC Autofill", card_name)
-            return self._download_image(mpc_image_url, output_path)
-        logger.debug("Card '%s' not found on MPC Autofill; falling back to Scryfall", card_name)
+        # 2. Everything else: Scryfall (then Moxfield).
+        art = _effective_art(card_name, _scryfall_art(art))
         image_url = self._resolve_image_url(card_name, art)
         if not image_url:
             return False
+        logger.info("Card '%s' -> Scryfall (%s, ~300 DPI)", card_name, self.image_format)
         return self._download_image(image_url, output_path)
 
     def fetch_card_back_image(
@@ -194,19 +200,22 @@ class MTGStrategy(TCGStrategy):
         output_path: str,
         art: str | None = None,
     ) -> bool:
-        """Save the back face of a double-faced card (same printing as front)."""
-        # A pinned MPC front says nothing about the Scryfall printing.
-        art = None if _mpc_identifier(art) is not None else _effective_art(card_name, art)
-        clean_name, _, _ = _parse_card_reference(card_name)
-        # 1. MPC Autofill DFC pairs (name only, like the front lookup).
-        mpc_back_url, mpc_back_name = self._lookup_mpc_back(clean_name)
-        if mpc_back_url:
-            logger.info(
-                "Card '%s' is double-faced%s; downloading its back face.",
-                card_name,
-                f" (back: '{mpc_back_name}')" if mpc_back_name else "",
-            )
-            return self._download_image(mpc_back_url, output_path)
+        """Save the back face of a double-faced card (same source as the front)."""
+        if _mpc_identifier(art) is not None:
+            # MPC front: its back comes from the MPC DFC pairs when possible.
+            clean_name, _, _ = _parse_card_reference(card_name)
+            mpc_back_url, mpc_back_name = self._lookup_mpc_back(clean_name)
+            if mpc_back_url:
+                logger.info(
+                    "Card '%s' is double-faced (back: '%s'); downloading its back face.",
+                    card_name,
+                    mpc_back_name,
+                )
+                return self._download_image(mpc_back_url, output_path)
+            # A pinned MPC front says nothing about the Scryfall printing.
+            art = None
+        else:
+            art = _effective_art(card_name, _scryfall_art(art))
         card = self._resolve_card(card_name, art)
         if card is None:
             return False
@@ -228,79 +237,91 @@ class MTGStrategy(TCGStrategy):
         )
         return self._download_image(back_url, output_path)
 
-    def pin_art(self, card_name: str, art: str | None = None) -> str | None:
-        """Pin the MPC Autofill search hit as ``mpc:<identifier>``.
-
-        MPC ranks its search results by the source order the server returns,
-        which changes as sources and images are added; the identifier always
-        names the same image. Cards MPC cannot find keep their marker
-        (Scryfall fallback).
-        """
-        if _mpc_identifier(art) is not None:
-            return art
-        clean_name, _, _ = _parse_card_reference(card_name)
-        identifiers = self._mpc_search_identifiers(clean_name)
-        if not identifiers:
-            return art
-        return f"{MPC_ART_PREFIX}{identifiers[0]}"
-
     def pin_back(self, card_name: str, art: str | None = None) -> tuple[str, str | None] | None:
-        """Pin the MPC ``DFCPairs`` back of a pinned MPC front."""
+        """Pin the MPC ``DFCPairs`` back of an MPC front as ``/ Back [mpc:<id>]``.
+
+        The back image is the highest-DPI MPC hit for the back name, written
+        into the saved decklist so later runs reuse it. Scryfall fronts keep
+        their automatic Scryfall back.
+        """
         if _mpc_identifier(art) is None:
             return None
         clean_name, _, _ = _parse_card_reference(card_name)
         back_name = self._mpc_back_name(clean_name)
         if not back_name:
             return None
-        identifiers = self._mpc_search_identifiers(back_name)
-        if not identifiers:
+        card = self._mpc_best_card(back_name)
+        if card is None:
             return None
-        return back_name, f"{MPC_ART_PREFIX}{identifiers[0]}"
+        return back_name, f"{MPC_ART_PREFIX}{card['identifier']}"
+
+    def prefetch(self, cards: list[DeckCard]) -> None:
+        """Batch the MPC Autofill lookups of a deck's ``[mpc:<id>]`` entries.
+
+        Only entries with an MPC marker touch MPC: their card documents are
+        fetched ``MPC_CARDS_BATCH_SIZE`` at a time, and the back names of
+        MPC fronts without an explicit back are searched in one batched
+        ``editorSearch`` call, so the rate limit is never hit by a deck.
+        """
+        identifiers: list[str] = []
+        back_names: list[str] = []
+        for card in cards:
+            for art in (card.art, card.back_art if card.back_name else None):
+                identifier = _mpc_identifier(art)
+                if identifier is not None:
+                    identifiers.append(identifier)
+            if not card.back_name and _mpc_identifier(card.art) is not None:
+                back_name = self._mpc_back_name(_parse_card_reference(card.name)[0])
+                if back_name:
+                    back_names.append(back_name)
+        if back_names:
+            self._mpc_search_many(back_names)
+            for name in back_names:
+                identifiers.extend(self._mpc_search_cache.get(_normalize(name), []))
+        if identifiers:
+            self._mpc_cards(identifiers)
 
     def list_art_options(self, card_name: str) -> list[ArtOption]:
-        """List every printing of a card (newest first) as ``set:collector`` arts.
+        """List every MPC Autofill art, then every Scryfall printing.
 
-        Printings whose set/collector cannot be written as an ``[art]``
-        marker (e.g. The List's ``plst:BLC-129``) are skipped. Tokens and
-        other extras are only searched when the card has no regular
-        printing (``Bird (teoc)``).
+        MPC arts (``mpc:<identifier>``, the only way a card uses MPC) come
+        first, highest DPI first, labeled with source, DPI and file size.
+        Scryfall printings follow (newest first) as ``set:collector`` arts
+        (~300 DPI scans). Printings whose set/collector cannot be written as
+        an ``[art]`` marker (e.g. The List's ``plst:BLC-129``) are skipped.
+        Tokens and other extras are only searched when the card has no
+        regular printing (``Bird (teoc)``).
         """
         clean_name, _, _ = _parse_card_reference(card_name)
+        options = [_mpc_art_option(card) for card in self._mpc_ranked_cards(clean_name)]
         prints = self._search_all_prints(f'!"{clean_name}"')
         if not prints:
             prints = self._search_all_prints(f'!"{clean_name}" include:extras')
-        options = [_art_option(card) for card in prints]
+        options.extend(_art_option(card) for card in prints)
         return [option for option in options if option is not None]
 
     # ------------------------------------------------------------------
-    # Source 0: MPC Autofill (primary)
+    # MPC Autofill (explicit '[mpc:<identifier>]' arts and the art picker)
     # ------------------------------------------------------------------
-    def _lookup_mpc_image(self, clean_name: str) -> str | None:
-        """Resolve a card name to an MPC Autofill full-resolution image URL.
+    def _mpc_best_card(self, clean_name: str) -> dict[str, Any] | None:
+        """Highest-DPI MPC Autofill hit for a card name (``None`` if none).
 
         Searches the community database by name only (decklist set
-        annotations and ``[art]`` markers are ignored) and returns the
-        first hit's ``downloadLink`` (falling back to its thumbnails).
-        Returns ``None`` when MPC has no hit so the caller falls back to
-        Scryfall.
+        annotations and ``[art]`` markers are ignored). Returns ``None``
+        when MPC has no hit so the caller falls back to Scryfall.
+        """
+        ranked = self._mpc_ranked_cards(clean_name)
+        return ranked[0] if ranked else None
+
+    def _mpc_ranked_cards(self, clean_name: str) -> list[dict[str, Any]]:
+        """Every MPC hit for a name, highest DPI first (ties keep MPC order).
+
+        Checklist / placeholder stand-ins go last so they are never the
+        default art.
         """
         identifiers = self._mpc_search_identifiers(clean_name)
-        if not identifiers:
-            return None
-        card = self._mpc_card(identifiers[0])
-        if card is None:
-            return None
-        logger.debug(
-            "Card '%s' matched '%s' on MPC Autofill",
-            clean_name,
-            card.get("name"),
-        )
-        return self._mpc_image_url(card)
-
-    def _lookup_mpc_pinned_image(self, identifier: str) -> str | None:
-        """Image URL of a pinned MPC card (``None`` if it was removed)."""
-        card = self._mpc_card(identifier)
-        return self._mpc_image_url(card) if card is not None else None
+        cards = [card for card in self._mpc_cards(identifiers) if self._mpc_image_url(card)]
+        return sorted(cards, key=lambda card: (_is_mpc_stand_in(card), -_mpc_dpi(card)))
 
     def _lookup_mpc_back(self, clean_name: str) -> tuple[str | None, str | None]:
         """Resolve a double-faced back via MPC ``DFCPairs``.
@@ -311,7 +332,11 @@ class MTGStrategy(TCGStrategy):
         back_name = self._mpc_back_name(clean_name)
         if not back_name:
             return None, None
-        return self._lookup_mpc_image(back_name), back_name
+        card = self._mpc_best_card(back_name)
+        if card is None:
+            return None, back_name
+        _log_mpc_choice(back_name, card)
+        return self._mpc_image_url(card), back_name
 
     def _mpc_back_name(self, clean_name: str) -> str | None:
         """Back-face name of an MPC double-faced card (case-insensitive)."""
@@ -326,20 +351,42 @@ class MTGStrategy(TCGStrategy):
         return back_name or None
 
     def _mpc_search_identifiers(self, clean_name: str) -> list[str]:
-        """Search MPC Autofill for a card name (cached per run)."""
+        """Search MPC Autofill for a card name (cached per run).
+
+        Failed requests (rate limit, network) are not cached, so the next
+        lookup tries again instead of treating the card as missing.
+        """
         key = _normalize(clean_name)
         if key not in self._mpc_search_cache:
-            self._mpc_search_cache[key] = self._mpc_editor_search(clean_name)
-        return self._mpc_search_cache[key]
+            self._mpc_search_many([clean_name])
+        return self._mpc_search_cache.get(key, [])
 
-    def _mpc_editor_search(self, clean_name: str) -> list[str]:
-        """Run one MPC ``editorSearch`` query, returning card identifiers."""
-        query = clean_name.strip()
-        if not query:
-            return []
+    def _mpc_search_many(self, clean_names: list[str]) -> None:
+        """Search many names with batched ``editorSearch`` calls (fills the cache)."""
+        queries = list(
+            dict.fromkeys(
+                name.strip()
+                for name in clean_names
+                if name.strip() and _normalize(name) not in self._mpc_search_cache
+            )
+        )
+        for start in range(0, len(queries), self.MPC_SEARCH_BATCH_SIZE):
+            batch = queries[start : start + self.MPC_SEARCH_BATCH_SIZE]
+            hits = self._mpc_editor_search(batch)
+            if hits is None:
+                continue  # failed: leave uncached so a later lookup retries
+            for query in batch:
+                self._mpc_search_cache[_normalize(query)] = hits.get(_normalize(query), [])
+
+    def _mpc_editor_search(self, queries: list[str]) -> dict[str, list[str]] | None:
+        """Run one MPC ``editorSearch`` call for several names.
+
+        Returns ``{normalized name: identifiers}`` (names without hits are
+        absent), or ``None`` when the request failed.
+        """
         sources = self._mpc_source_settings()
         if sources is None:
-            return []
+            return None
         payload: dict[str, Any] = {
             "searchSettings": {
                 "searchTypeSettings": {"fuzzySearch": True, "filterCardbacks": False},
@@ -353,46 +400,32 @@ class MTGStrategy(TCGStrategy):
                     "excludesTags": [],
                 },
             },
-            "queries": [{"query": query, "cardType": "CARD"}],
+            "queries": [{"query": query, "cardType": "CARD"} for query in queries],
         }
-        logger.debug("MPC Autofill search for '%s'", query)
-        resp = self._mpc_post(self.MPC_EDITOR_SEARCH_ENDPOINT, payload)
-        if resp is None or resp.status_code != 200:
-            logger.debug("MPC Autofill search returned HTTP %s", getattr(resp, "status_code", "error"))
-            return []
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            return []
-        results = data.get("results")
+        logger.debug("MPC Autofill search for %d name(s)", len(queries))
+        data = self._mpc_json(self._mpc_post(self.MPC_EDITOR_SEARCH_ENDPOINT, payload))
+        results = data.get("results") if data is not None else None
         if not isinstance(results, dict):
-            return []
-        want = _normalize(query)
+            return None
+        hits: dict[str, list[str]] = {}
         for raw_key, per_type in results.items():
-            if _normalize(str(raw_key)) == want and isinstance(per_type, dict):
-                hits = per_type.get("CARD")
-                if isinstance(hits, list):
-                    return [h for h in hits if isinstance(h, str) and h]
-        return []
+            if isinstance(per_type, dict) and isinstance(per_type.get("CARD"), list):
+                hits[_normalize(str(raw_key))] = [
+                    h for h in per_type["CARD"] if isinstance(h, str) and h
+                ]
+        return hits
 
     def _mpc_source_settings(self) -> list[list[Any]] | None:
         """MPC ``[[source_pk, True], ...]`` search scope (fetched once per run)."""
-        if not self._mpc_sources_loaded:
-            self._mpc_sources_loaded = True
+        if self._mpc_sources_cache is None:
             self._mpc_sources_cache = self._fetch_mpc_sources()
         return self._mpc_sources_cache
 
     def _fetch_mpc_sources(self) -> list[list[Any]] | None:
-        resp = self._mpc_get(self.MPC_SOURCES_ENDPOINT)
-        if resp is None or resp.status_code != 200:
-            logger.debug("MPC Autofill sources unavailable; skipping MPC Autofill")
-            return None
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
-        results = data.get("results")
+        data = self._mpc_json(self._mpc_get(self.MPC_SOURCES_ENDPOINT))
+        results = data.get("results") if data is not None else None
         if not isinstance(results, dict) or not results:
+            logger.debug("MPC Autofill sources unavailable; skipping MPC Autofill for now")
             return None
         settings = [
             [entry["pk"], True]
@@ -403,23 +436,34 @@ class MTGStrategy(TCGStrategy):
 
     def _mpc_card(self, identifier: str) -> dict[str, Any] | None:
         """Fetch one MPC card document (cached per run)."""
-        if identifier not in self._mpc_card_cache:
-            self._mpc_card_cache[identifier] = self._fetch_mpc_card(identifier)
-        return self._mpc_card_cache[identifier]
+        cards = self._mpc_cards([identifier])
+        return cards[0] if cards else None
 
-    def _fetch_mpc_card(self, identifier: str) -> dict[str, Any] | None:
-        resp = self._mpc_post(self.MPC_CARDS_ENDPOINT, {"cardIdentifiers": [identifier]})
-        if resp is None or resp.status_code != 200:
-            return None
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
-        results = data.get("results")
+    def _mpc_cards(self, identifiers: list[str]) -> list[dict[str, Any]]:
+        """Fetch MPC card documents in batches (cached per run, input order)."""
+        missing = [i for i in dict.fromkeys(identifiers) if i not in self._mpc_card_cache]
+        for start in range(0, len(missing), self.MPC_CARDS_BATCH_SIZE):
+            batch = missing[start : start + self.MPC_CARDS_BATCH_SIZE]
+            found = self._fetch_mpc_cards(batch)
+            if found is None:
+                continue  # failed: leave uncached so a later lookup retries
+            for identifier in batch:
+                self._mpc_card_cache[identifier] = found.get(identifier)
+        cards = (self._mpc_card_cache.get(i) for i in identifiers)
+        return [card for card in cards if card is not None]
+
+    def _fetch_mpc_cards(self, identifiers: list[str]) -> dict[str, dict[str, Any]] | None:
+        """``{identifier: card}`` for one ``/2/cards/`` call (``None`` if it failed)."""
+        data = self._mpc_json(self._mpc_post(self.MPC_CARDS_ENDPOINT, {"cardIdentifiers": identifiers}))
+        results = data.get("results") if data is not None else None
         if not isinstance(results, dict):
             return None
-        card = results.get(identifier)
-        return card if isinstance(card, dict) else None
+        wanted = set(identifiers)
+        return {
+            identifier: card
+            for identifier, card in results.items()
+            if identifier in wanted and isinstance(card, dict)
+        }
 
     @staticmethod
     def _mpc_image_url(card: dict[str, Any]) -> str | None:
@@ -433,20 +477,17 @@ class MTGStrategy(TCGStrategy):
     def _mpc_dfc_pairs_map(self) -> dict[str, str]:
         """MPC double-faced ``{front: back}`` pairs (fetched once per run)."""
         if self._mpc_dfc_pairs is None:
-            self._mpc_dfc_pairs = self._fetch_mpc_dfc_pairs()
+            pairs = self._fetch_mpc_dfc_pairs()
+            if pairs is None:
+                return {}  # failed: retry on the next lookup
+            self._mpc_dfc_pairs = pairs
         return self._mpc_dfc_pairs
 
-    def _fetch_mpc_dfc_pairs(self) -> dict[str, str]:
-        resp = self._mpc_get(self.MPC_DFC_PAIRS_ENDPOINT)
-        if resp is None or resp.status_code != 200:
-            return {}
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            return {}
-        pairs = data.get("dfcPairs")
+    def _fetch_mpc_dfc_pairs(self) -> dict[str, str] | None:
+        data = self._mpc_json(self._mpc_get(self.MPC_DFC_PAIRS_ENDPOINT))
+        pairs = data.get("dfcPairs") if data is not None else None
         if not isinstance(pairs, dict):
-            return {}
+            return None
         return {
             str(front): str(back)
             for front, back in pairs.items()
@@ -454,18 +495,64 @@ class MTGStrategy(TCGStrategy):
         }
 
     def _mpc_get(self, endpoint: str) -> requests.Response | None:
-        try:
-            return self._session.get(f"{self.mpc_url}{endpoint}", timeout=self.timeout)
-        except requests.RequestException as exc:
-            logger.warning("MPC Autofill request to %s failed: %s", endpoint, exc)
-            return None
+        return self._mpc_request("GET", endpoint)
 
     def _mpc_post(self, endpoint: str, payload: dict[str, Any]) -> requests.Response | None:
-        try:
-            return self._session.post(f"{self.mpc_url}{endpoint}", json=payload, timeout=self.timeout)
-        except requests.RequestException as exc:
-            logger.warning("MPC Autofill request to %s failed: %s", endpoint, exc)
+        return self._mpc_request("POST", endpoint, payload)
+
+    def _mpc_request(
+        self, method: str, endpoint: str, payload: dict[str, Any] | None = None
+    ) -> requests.Response | None:
+        """Send one MPC Autofill request, paced and retried on HTTP 429.
+
+        mpcfill.com sits behind Cloudflare, which answers bursts (~10 calls
+        in a few seconds) with HTTP 429 + ``Retry-After``: requests are
+        spaced by ``mpc_min_request_interval`` and a 429 waits for the
+        advertised delay before retrying.
+        """
+        url = f"{self.mpc_url}{endpoint}"
+        for attempt in range(self.MPC_RATE_LIMIT_RETRIES + 1):
+            self._mpc_throttle()
+            try:
+                if method == "POST":
+                    resp = self._session.post(url, json=payload, timeout=self.timeout)
+                else:
+                    resp = self._session.get(url, timeout=self.timeout)
+            except requests.RequestException as exc:
+                logger.warning("MPC Autofill request to %s failed: %s", endpoint, exc)
+                return None
+            if resp.status_code != 429 or attempt == self.MPC_RATE_LIMIT_RETRIES:
+                return resp
+            retry_after = min(
+                _parse_retry_after(resp.headers.get("Retry-After"), self.MPC_RATE_LIMIT_RETRY_SECONDS),
+                self.MPC_MAX_RETRY_SECONDS,
+            )
+            logger.warning(
+                "MPC Autofill rate limit hit for %s; retrying in %.0fs", endpoint, retry_after
+            )
+            time.sleep(retry_after)
+        return None
+
+    def _mpc_throttle(self) -> None:
+        """Enforce the minimum interval between MPC Autofill requests."""
+        if self.mpc_min_request_interval <= 0:
+            return
+        wait = self.mpc_min_request_interval - (time.monotonic() - self._mpc_last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        self._mpc_last_request_at = time.monotonic()
+
+    def _mpc_json(self, resp: requests.Response | None) -> dict[str, Any] | None:
+        """JSON body of a successful MPC response (``None`` otherwise)."""
+        if resp is None or resp.status_code != 200:
+            if resp is not None:
+                logger.debug("MPC Autofill returned HTTP %s", resp.status_code)
             return None
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     # ------------------------------------------------------------------
     # Resolution helpers (Scryfall + Moxfield fallbacks)
@@ -964,6 +1051,55 @@ def _mpc_identifier(art: str | None) -> str | None:
     return None
 
 
+def _scryfall_art(art: str | None) -> str | None:
+    """Scryfall ``[art]`` marker, dropping a legacy ``scryfall:`` prefix."""
+    if art and art[: len(SCRYFALL_ART_PREFIX)].lower() == SCRYFALL_ART_PREFIX:
+        return art[len(SCRYFALL_ART_PREFIX) :].strip() or None
+    return art
+
+
+def _mpc_dpi(card: dict[str, Any]) -> int:
+    dpi = card.get("dpi")
+    return dpi if isinstance(dpi, int) else 0
+
+
+def _is_mpc_stand_in(card: dict[str, Any]) -> bool:
+    """True for MPC checklist / placeholder images (not the real card art)."""
+    return bool(_MPC_STAND_IN.search(str(card.get("name") or "")))
+
+
+def _mpc_quality(card: dict[str, Any]) -> str:
+    """``"1200 DPI · 3.7 MB · MrTeferi"``-style summary of an MPC image."""
+    parts = [f"{_mpc_dpi(card)} DPI" if _mpc_dpi(card) else "DPI ?"]
+    size = card.get("size")
+    if isinstance(size, int) and size > 0:
+        parts.append(f"{size / 1_000_000:.1f} MB")
+    source = card.get("sourceName") or card.get("source")
+    if source:
+        parts.append(str(source))
+    return " · ".join(parts)
+
+
+def _log_mpc_choice(card_name: str, card: dict[str, Any]) -> None:
+    logger.info(
+        "Card '%s' -> MPC Autofill '%s' (%s)",
+        card_name,
+        card.get("name"),
+        _mpc_quality(card),
+    )
+
+
+def _mpc_art_option(card: dict[str, Any]) -> ArtOption | None:
+    """Build the art-picker option of one MPC Autofill image."""
+    identifier = card.get("identifier")
+    # w400 previews: plenty for the picker grid and ~4x lighter than w800.
+    image_url = card.get("smallThumbnailUrl") or card.get("mediumThumbnailUrl")
+    if not isinstance(identifier, str) or not identifier or not isinstance(image_url, str):
+        return None
+    label = f"MPC · {_mpc_quality(card)} · {card.get('name')}"
+    return ArtOption(value=f"{MPC_ART_PREFIX}{identifier}", label=label, image_url=image_url)
+
+
 def _effective_art(card_name: str, art: str | None) -> str | None:
     """Validate an ``[art]`` marker for MTG, warning on Lorcana-only values."""
     if art is None:
@@ -1112,7 +1248,7 @@ def _art_option(card: dict[str, Any]) -> ArtOption | None:
     image_url = image_uris.get("normal") or image_uris.get("small")
     if not isinstance(image_url, str) or not image_url:
         return None
-    label = f"{card.get('set_name') or set_code.upper()} ({set_code.upper()}) #{collector}"
+    label = f"Scryfall · ~300 DPI · {card.get('set_name') or set_code.upper()} ({set_code.upper()}) #{collector}"
     variants = [v for v in MTG_VARIANT_CHOICES if _matches_variant(card, v)]
     if variants:
         label += " · " + ", ".join(variants)

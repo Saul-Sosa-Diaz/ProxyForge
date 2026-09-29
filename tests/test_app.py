@@ -210,18 +210,24 @@ def test_move_whole_tab_to_foil(tmp_path):
     assert _tab_labels(at) == ["✨ Foil"]
 
 
-def test_decklist_txt_rebuilds_the_edited_deck(tmp_path):
-    at = _resolve_local_deck(tmp_path, "2 Pikachu\n1 Pikachu / Charizard")
+def test_decklist_is_shown_next_to_the_original_and_saved_live(tmp_path):
+    original = "2 Pikachu\n1 Pikachu / Charizard"
+    at = _resolve_local_deck(tmp_path, original)
+    written = tmp_path / "local" / "preview" / "preview.txt"
+    assert written.read_text(encoding="utf-8") == "2 Pikachu\n1 Pikachu / Charizard\n"
+    assert any("sin cambios" in c.value for c in at.caption)
+
     _button(at, "Pasar a foil").click().run()
 
-    txt = next(b for b in at.get("download_button") if "decklist" in b.proto.label)
-    assert txt.proto.label == "📝 Descargar decklist (.txt)"
     expected = "2 Pikachu *F*\n1 Pikachu / Charizard\n"
     assert parse_deck_text(expected) == [r.card for r in at.session_state.resolved]
+    assert [c.value for c in at.code] == [original, expected.strip()]
+    assert any("1 línea cambiada" in c.value for c in at.caption)
+    assert written.read_text(encoding="utf-8") == expected  # saved without generating PDFs
+    assert not [b for b in at.get("download_button") if "decklist" in b.proto.label]
 
     _button(at, "Generar PDFs").click().run()
-    written = tmp_path / "local" / "preview" / "preview.txt"
-    assert written.read_text(encoding="utf-8") == expected
+    assert written in at.session_state.pdfs
 
 
 def test_zip_contains_every_generated_file(tmp_path):
@@ -233,3 +239,78 @@ def test_zip_contains_every_generated_file(tmp_path):
         f.write_text("x", encoding="utf-8")
     names = zipfile.ZipFile(io.BytesIO(_zip_files(files))).namelist()
     assert names == ["a.pdf", "a.txt"]
+
+
+class _PreviewResponse:
+    def __init__(self, status_code, content=b""):
+        self.status_code = status_code
+        self.content = content
+
+
+def test_art_preview_retries_throttled_downloads(monkeypatch):
+    import src.app as app
+
+    responses = [_PreviewResponse(429), _PreviewResponse(200, CARD_PNG.read_bytes())]
+    monkeypatch.setattr(app.requests, "get", lambda url, timeout, headers: responses.pop(0))
+    monkeypatch.setattr(app.time, "sleep", lambda seconds: None)
+
+    preview = app._fetch_art_thumbnail("https://drive.google.com/thumbnail?id=x")
+
+    assert preview is not None and preview.startswith(b"\xff\xd8")  # JPEG
+    assert responses == []
+
+
+def test_art_preview_gives_up_after_retries(monkeypatch):
+    import src.app as app
+
+    monkeypatch.setattr(app.requests, "get", lambda url, timeout, headers: _PreviewResponse(429))
+    monkeypatch.setattr(app.time, "sleep", lambda seconds: None)
+
+    assert app._fetch_art_thumbnail("https://drive.google.com/thumbnail?id=y") is None
+
+
+def test_art_preview_reads_local_files():
+    import src.app as app
+
+    assert app._fetch_art_thumbnail(str(CARD_PNG)).startswith(b"\xff\xd8")
+    assert app._fetch_art_thumbnail(str(CARD_PNG) + ".missing") is None
+
+
+def test_art_preview_is_cached_on_disk(tmp_path, monkeypatch):
+    import src.app as app
+
+    url = "https://drive.google.com/thumbnail?id=cached"
+    calls = []
+
+    def fake_get(url, timeout, headers):
+        calls.append(url)
+        return _PreviewResponse(200, CARD_PNG.read_bytes())
+
+    monkeypatch.setattr(app, "ART_THUMBNAIL_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    store, _ = app._art_thumbnail_store()
+
+    assert app._cached_art_thumbnail(url) == (False, None)
+    preview = app._load_art_thumbnail(url)
+    store.pop(url)  # simulate an app restart: memory cache gone
+
+    assert app._cached_art_thumbnail(url) == (True, preview)
+    assert len(calls) == 1
+    assert list(tmp_path.glob("*.jpg"))
+
+
+def test_art_preview_sends_a_user_agent_and_skips_permanent_errors(monkeypatch):
+    import src.app as app
+
+    calls = []
+
+    def fake_get(url, timeout, headers):
+        calls.append(headers)
+        return _PreviewResponse(400)
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    monkeypatch.setattr(app.time, "sleep", lambda seconds: None)
+
+    assert app._fetch_art_thumbnail("https://cards.scryfall.io/normal/x.jpg") is None
+    assert len(calls) == 1  # 400 is not retried
+    assert "python-requests" not in calls[0]["User-Agent"]

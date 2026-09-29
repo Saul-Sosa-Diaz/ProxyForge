@@ -4,11 +4,13 @@ from __future__ import annotations
 import re
 
 import pytest
+from PIL import Image
 
-from mocks import IMAGES_DIR, FakeStrategy, deck
-from src.exporter import Exporter
+from mocks import CARD_PNG, IMAGES_DIR, FakeStrategy, deck
+from src.exporter import Exporter, _source_bleed_mm, estimate_print_dpi
 from src.models import DeckCard
 from src.parser import parse_deck_file
+from src.pdf import PdfWriter
 from src.strategies.local import LocalStrategy
 
 LOW_DPI = 50
@@ -163,3 +165,44 @@ def test_star_printing_gets_its_own_file(tmp_path):
         DeckCard(quantity=1, name="Sol Ring", art="sld:1512"),
     ])
     assert star.front_path != plain.front_path
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [((69, 94), 3.0), ((3264, 4440), 3.19), ((744, 1040), 0.0), ((63, 88), 0.0), ((100, 100), 0.0)],
+)
+def test_source_bleed_is_derived_from_the_aspect_ratio(tmp_path, size, expected):
+    image = tmp_path / "card.png"
+    Image.new("RGB", size).save(image)
+
+    assert _source_bleed_mm(image) == pytest.approx(expected, abs=0.01)
+
+
+def test_source_bleed_replaces_the_mirrored_bleed(tmp_path):
+    image = tmp_path / "mpc.png"
+    Image.new("RGB", (69, 94)).save(image)  # 63x88 mm card + 3 mm bleed per side
+    exporter = Exporter(FakeStrategy(), str(tmp_path))
+    geo = exporter._page_geometry()
+
+    ops = exporter._card_ops(PdfWriter(), geo, image, 0, 0)
+
+    assert ops.count(" Do Q") == 1  # no mirrored strips
+    x = geo.start_x
+    assert f"{x - geo.bleed:.4f}".rstrip("0") in ops  # clipped at the 1 mm bleed
+    assert f"{x - 3 * 72 / 25.4:.4f}".rstrip("0") in ops  # image starts 3 mm before the trim
+
+
+def test_plain_card_keeps_the_mirrored_bleed(tmp_path):
+    exporter = Exporter(FakeStrategy(), str(tmp_path))
+
+    ops = exporter._card_ops(PdfWriter(), exporter._page_geometry(), CARD_PNG, 0, 0)
+
+    assert ops.count(" Do Q") == 9  # 8 mirrored strips + the card
+
+
+@pytest.mark.parametrize(("size", "expected"), [((3264, 4440), 1195), ((745, 1040), 300), ((63, 88), 25)])
+def test_estimate_print_dpi_ignores_the_source_bleed(tmp_path, size, expected):
+    image = tmp_path / "card.png"
+    Image.new("RGB", size).save(image)
+
+    assert estimate_print_dpi(image) == expected

@@ -57,6 +57,8 @@ _ART_MARKER = re.compile(
 # Pinned MPC Autofill image: '[mpc:1k4w07AFcKua0ldRpmTgXx0pTsEGv4kxg]'. The
 # identifier is case-sensitive, so it is matched before any lowercasing.
 _MPC_ART = re.compile(r"^mpc\s*:\s*(?P<identifier>[A-Za-z0-9_-]{8,128})$", re.IGNORECASE)
+# Forced Scryfall printing (MTG web art picker): '[scryfall:sld:2195]'.
+_SCRYFALL_ART = re.compile(r"^scryfall\s*:\s*(?P<art>.+)$", re.IGNORECASE)
 
 _SET_CODE = r"[a-z0-9]{2,5}"
 _COLLECTOR = r"(?:\d{1,4}[a-z\u2605]{0,2}|\u2605)"
@@ -98,6 +100,8 @@ def _parse_art_content(content: str) -> str | None:
           borderless m21, 2x2:117 showcase, showcase 2x2 117 ...
         - MTG pinned MPC Autofill image: mpc:<identifier> (identifier
           case preserved)
+        - MTG forced Scryfall art: scryfall:<any MTG form above>
+          (e.g. scryfall:sld:2195), skips MPC Autofill
 
     Returns the normalized art string (e.g. ``"m21"``, ``"2x2:117"``,
     ``"borderless"``, ``"m21 borderless"``, ``"mpc:1k4w07AF..."``) or
@@ -106,6 +110,12 @@ def _parse_art_content(content: str) -> str | None:
     mpc = _MPC_ART.match(content.strip())
     if mpc:
         return f"mpc:{mpc.group('identifier')}"
+    scryfall = _SCRYFALL_ART.match(content.strip())
+    if scryfall:
+        inner = _parse_art_content(scryfall.group("art"))
+        if inner is None or inner.startswith(("mpc:", "scryfall:")):
+            return None
+        return f"scryfall:{inner}"
     text = content.strip().lower()
     if not text:
         return None
