@@ -58,6 +58,10 @@ class ArtOption(BaseModel):
     value: str = Field(description="'[art]' marker that selects this art (e.g. '2x2:117', 'enchanted').")
     label: str = Field(description="Human-readable description (set, number, variant...).")
     image_url: str = Field(description="Preview image URL of this art.")
+    keywords: str = Field(
+        default="",
+        description="Extra text the art picker filter matches (tags, artist...), not displayed.",
+    )
 
 
 class ResolvedCard(BaseModel):

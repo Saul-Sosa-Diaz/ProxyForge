@@ -58,6 +58,10 @@ GRID_COLUMNS = 4
 ART_GRID_COLUMNS = 4
 # Height (px) of the scrollable art-picker grid.
 ART_GRID_HEIGHT = 640
+# Arts drawn per step: cards like basic lands have thousands of arts (2000+
+# MPC images for Island), so the grid grows with "Mostrar más" instead of
+# drawing (and downloading previews for) all of them at once.
+ART_PICKER_STEP = 48
 THUMBNAIL_SIZE = (360, 504)
 # Height (px) of each side of the original / current decklist comparison.
 DECKLIST_HEIGHT = 320
@@ -549,19 +553,33 @@ def _art_dialog(index: int) -> None:
         st.info("No hay artes alternativos para esta carta.")
         return
 
+    total = len(options)
     query = st.text_input(
-        "Filtrar", placeholder="Fuente, DPI, set, variante…"
-    ).strip().lower()
-    if query:
-        options = [o for o in options if query in o.label.lower() or query in o.value.lower()]
-    st.caption(f"{len(options)} artes")
+        "Filtrar",
+        placeholder="Fuente, DPI, set, variante, etiqueta… (p. ej. «tmt», «mpc 1200», «full-art»)",
+    )
+    options = _filter_art_options(options, query)
+    # How many arts are drawn; restarts when the filter changes.
+    limit_key = f"art-limit-{index}"
+    if st.session_state.get(f"{limit_key}-query") != query:
+        st.session_state[f"{limit_key}-query"] = query
+        st.session_state[limit_key] = ART_PICKER_STEP
+    limit = st.session_state.get(limit_key, ART_PICKER_STEP)
+    visible = options[:limit]
+    found_text = f"{len(options)} de {total} artes" if query.strip() else f"{total} artes"
+    st.caption(f"{found_text} · mostrando {len(visible)}")
+    if not options:
+        st.info(
+            "Ningún arte coincide. Prueba con el código del set (p. ej. «tmt»), su nombre "
+            "o sus iniciales («tmnt»), la fuente o el DPI."
+        )
     # The grid is drawn at once with a placeholder per preview; missing
     # previews are then streamed into their placeholders as they arrive.
     pending: dict[str, list] = {}
     grid = st.container(height=ART_GRID_HEIGHT, border=False)
-    for row_start in range(0, len(options), ART_GRID_COLUMNS):
+    for row_start in range(0, len(visible), ART_GRID_COLUMNS):
         columns = grid.columns(ART_GRID_COLUMNS)
-        for column, option in zip(columns, options[row_start : row_start + ART_GRID_COLUMNS]):
+        for column, option in zip(columns, visible[row_start : row_start + ART_GRID_COLUMNS]):
             with column:
                 slot = st.empty()
                 found, preview = _cached_art_thumbnail(option.image_url)
@@ -579,8 +597,37 @@ def _art_dialog(index: int) -> None:
                     disabled=selected,
                 ):
                     _choose_art(index, item, ctx, deck_name, option.value)
+    remaining = len(options) - len(visible)
+    if remaining:
+        # on_click (no st.rerun): only the dialog reruns, so it stays open
+        # and keeps its scroll position while the next arts are appended.
+        grid.button(
+            f"⬇️ Mostrar {min(remaining, ART_PICKER_STEP)} más (quedan {remaining})",
+            key=f"more-art-{index}",
+            width="stretch",
+            on_click=_show_more_arts,
+            args=(limit_key,),
+        )
     if pending:
         _stream_art_thumbnails(pending)
+
+
+def _show_more_arts(limit_key: str) -> None:
+    st.session_state[limit_key] = st.session_state.get(limit_key, ART_PICKER_STEP) + ART_PICKER_STEP
+
+
+def _filter_art_options(options: list[ArtOption], query: str) -> list[ArtOption]:
+    """Arts whose label, marker or keywords contain every word of ``query``."""
+    words = query.lower().split()
+    if not words:
+        return options
+    return [
+        option
+        for option in options
+        if all(
+            word in f"{option.label} {option.value} {option.keywords}".lower() for word in words
+        )
+    ]
 
 
 def _choose_art(

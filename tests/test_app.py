@@ -134,6 +134,44 @@ def test_generate_pdf_offers_downloads_per_file(tmp_path):
     assert {"⬇️ front_preview.pdf", "⬇️ back_preview.pdf"} <= set(labels)
 
 
+class ManyArtsStrategy(FakeArtStrategy):
+    """Card with more arts than one picker step (like basic lands on MPC)."""
+
+    def list_art_options(self, card_name):
+        return [
+            ArtOption(
+                value=f"art{i}",
+                label=f"MPC · Island [{'TMT' if i == 90 else 'M21'}] {{{i}}}",
+                image_url=str(CARD_PNG),
+                keywords="Full-Art" if i == 7 else "",
+            )
+            for i in range(120)
+        ]
+
+
+def _use_buttons(at: AppTest) -> int:
+    return [b.label for b in at.button].count("Usar este arte")
+
+
+def test_art_picker_draws_large_lists_step_by_step(tmp_path):
+    at = _resolve_local_deck(tmp_path, "1 Island", strategy=ManyArtsStrategy())
+    _button(at, "Arte").click().run()
+
+    assert _use_buttons(at) == 48
+    _button(at, "Mostrar 48 más").click().run()
+    assert not at.exception
+    assert _use_buttons(at) == 96
+    _button(at, "Mostrar 24 más").click().run()
+    assert _use_buttons(at) == 120
+    assert not [b for b in at.button if "Mostrar" in b.label]
+
+    filter_box = next(t for t in at.text_input if t.label == "Filtrar")
+    filter_box.input("island tmt").run()
+    assert _use_buttons(at) == 1  # every word must match; the step restarts
+    filter_box.input("full-art").run()  # keywords are searched too
+    assert _use_buttons(at) == 1
+
+
 def test_art_picker_replaces_the_card_image(tmp_path):
     at = _resolve_local_deck(tmp_path, "1 Bolt", strategy=FakeArtStrategy())
     original = at.session_state.resolved[0].front_path.read_bytes()

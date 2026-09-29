@@ -197,7 +197,7 @@ def test_list_art_options_falls_back_to_extras(tmp_path):
     options = strategy.list_art_options("Bird (teoc)")
 
     assert options
-    assert "include:extras" in strategy._session.calls[-1]
+    assert any("include:extras" in call for call in strategy._session.calls)
 
 
 def test_art_option_downloads_that_printing(tmp_path):
@@ -371,3 +371,21 @@ def test_rate_limited_sources_do_not_disable_mpc(tmp_path, monkeypatch):
 
     assert strategy.list_art_options("Lightning Bolt") == []
     assert [o.value for o in strategy.list_art_options("Lightning Bolt")] == ["mpc:mpc-id-1"]
+
+
+def test_art_options_can_be_found_by_set_name_and_initials(tmp_path):
+    routes = _mpc_routes()
+    routes["2/cards"] = FakeResponse(json_data={"results": {
+        "mpc-id-1": {"identifier": "mpc-id-1", "name": "Island [TMT] {192}", "dpi": 800,
+                     "downloadLink": "https://img.test/tmt.png",
+                     "smallThumbnailUrl": "https://img.test/tmt-thumb.jpg"},
+    }})
+    routes["api.scryfall.com/sets"] = FakeResponse(
+        json_data={"data": [{"code": "tmt", "name": "Teenage Mutant Ninja Turtles"}]}
+    )
+    strategy = _strategy(routes)
+
+    option = strategy.list_art_options("Lightning Bolt")[0]
+
+    assert "Teenage Mutant Ninja Turtles" in option.keywords
+    assert "tmnt" in option.keywords.split()

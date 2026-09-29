@@ -184,7 +184,11 @@ before printing:
    file size in the label, highest DPI first) and then every Scryfall
    printing (~300 DPI, saved as `[set:collector]`), filterable by
    source, DPI, set or variant; Enchanted / Iconic / Epic / Special / base for Lorcana.
-   All arts sit in one scrollable grid that shows up at once; each preview
+   The filter matches every word you type against source, DPI, set, name and
+   hidden keywords (MPC tags such as *Full-Art*, Scryfall artist), e.g.
+   `tmt` narrows 2,750 Island arts to the TMNT ones. The scrollable grid
+   draws 48 arts at a time and **⬇️ Mostrar más** adds the next 48, so
+   cards with thousands of arts (basic lands) stay responsive; each preview
    appears as soon as it arrives. The server downloads them (24 in
    parallel, with retries) because Google Drive throttles browsers that
    request hundreds of MPC thumbnails at once, and caches them in memory

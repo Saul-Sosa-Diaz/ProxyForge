@@ -88,6 +88,8 @@ MTG_ART_MODES = ("best", "base")
 MPC_ART_PREFIX = "mpc:"
 # Legacy '[scryfall:<art>]' marker (Scryfall is now the default): same as '[<art>]'.
 SCRYFALL_ART_PREFIX = "scryfall:"
+# Set code written next to a card name: '[TMT]', '(TMT)', or a 'tmt:192' marker.
+_SET_CODE_IN_TEXT = re.compile(r"(?:[\[(]|\b)([A-Za-z0-9]{2,5})(?:[\])]|:)")
 # MPC images that stand in for a card rather than show it.
 _MPC_STAND_IN = re.compile(r"\b(checklist|placeholder)\b", re.IGNORECASE)
 
@@ -101,6 +103,7 @@ class MTGStrategy(TCGStrategy):
     SCRYFALL_API_URL = "https://api.scryfall.com"
     NAMED_ENDPOINT = "/cards/named"
     SEARCH_ENDPOINT = "/cards/search"
+    SETS_ENDPOINT = "/sets"
     MOXFIELD_SEARCH_API_URL = "https://api.moxfield.com/v2/cards/search"
     MOXFIELD_ASSETS_URL = "https://assets.moxfield.net/cards"
     MPC_DEFAULT_URL = "https://mpcfill.com"
@@ -146,6 +149,8 @@ class MTGStrategy(TCGStrategy):
         # effective art): shared by the front and back fetches so a
         # double-faced card costs no extra API calls for its back face.
         self._card_cache: dict[tuple[str, str | None], dict[str, Any] | None] = {}
+        # Scryfall set code -> set name (art-picker filter keywords).
+        self._set_names: dict[str, str] | None = None
         # MPC Autofill caches, keyed by normalized name / identifier. The
         # sources list and the DFC pairs are fetched once per run. Only
         # successful responses are cached (a rate-limited call retries).
@@ -298,7 +303,27 @@ class MTGStrategy(TCGStrategy):
         if not prints:
             prints = self._search_all_prints(f'!"{clean_name}" include:extras')
         options.extend(_art_option(card) for card in prints)
-        return [option for option in options if option is not None]
+        sets = self._scryfall_set_names()
+        return [_with_set_keywords(option, sets) for option in options if option is not None]
+
+    def _scryfall_set_names(self) -> dict[str, str]:
+        """``{set code: set name}`` of every Scryfall set (fetched once per run).
+
+        Lets the art picker filter find arts by set name or its initials
+        ("turtles", "tmnt") when a label only carries the code (``[TMT]``).
+        A failed request is not cached.
+        """
+        if self._set_names is None:
+            data = self._api_get(self.SETS_ENDPOINT, {})
+            sets = data.get("data") if data is not None else None
+            if not isinstance(sets, list):
+                return {}
+            self._set_names = {
+                str(entry["code"]).lower(): str(entry["name"])
+                for entry in sets
+                if isinstance(entry, dict) and entry.get("code") and entry.get("name")
+            }
+        return self._set_names
 
     # ------------------------------------------------------------------
     # MPC Autofill (explicit '[mpc:<identifier>]' arts and the art picker)
@@ -1097,7 +1122,11 @@ def _mpc_art_option(card: dict[str, Any]) -> ArtOption | None:
     if not isinstance(identifier, str) or not identifier or not isinstance(image_url, str):
         return None
     label = f"MPC · {_mpc_quality(card)} · {card.get('name')}"
-    return ArtOption(value=f"{MPC_ART_PREFIX}{identifier}", label=label, image_url=image_url)
+    tags = card.get("tags")
+    keywords = " ".join(str(tag) for tag in tags) if isinstance(tags, list) else ""
+    return ArtOption(
+        value=f"{MPC_ART_PREFIX}{identifier}", label=label, image_url=image_url, keywords=keywords
+    )
 
 
 def _effective_art(card_name: str, art: str | None) -> str | None:
@@ -1231,6 +1260,28 @@ def _matches_variant(card: dict[str, Any], variant: str) -> bool:
     return False
 
 
+def _with_set_keywords(option: ArtOption, set_names: dict[str, str]) -> ArtOption:
+    """Add the name and initials of every set code in an art's text to its keywords.
+
+    MPC names mark the printing as ``Island [TMT] {192}`` / ``(TMT)`` and
+    Scryfall labels as ``... (TMT) #192``; the filter then also matches
+    "Teenage Mutant Ninja Turtles" and "tmnt".
+    """
+    words: list[str] = []
+    for code in dict.fromkeys(_SET_CODE_IN_TEXT.findall(f"{option.label} {option.value}")):
+        name = set_names.get(code.lower())
+        if name:
+            words += [name, _initials(name)]
+    if not words:
+        return option
+    return option.model_copy(update={"keywords": " ".join([option.keywords, *words]).strip()})
+
+
+def _initials(text: str) -> str:
+    """First letter of every word: "Teenage Mutant Ninja Turtles" -> "tmnt"."""
+    return "".join(word[0] for word in re.findall(r"[A-Za-z0-9]+", text)).lower()
+
+
 def _art_option(card: dict[str, Any]) -> ArtOption | None:
     """Build the art-picker option of one Scryfall printing (``None`` if unusable)."""
     set_code = str(card.get("set") or "").lower()
@@ -1255,7 +1306,8 @@ def _art_option(card: dict[str, Any]) -> ArtOption | None:
     if card.get("flavor_name") and card.get("name"):
         # Alternate-name printing (e.g. SLD "Chaos Emerald"): show the real card.
         label += f" · {card['name']}"
-    return ArtOption(value=value, label=label, image_url=image_url)
+    keywords = " ".join(str(card.get(key) or "") for key in ("artist", "frame", "released_at"))
+    return ArtOption(value=value, label=label, image_url=image_url, keywords=keywords)
 
 
 def _is_base_print(card: dict[str, Any]) -> bool:
