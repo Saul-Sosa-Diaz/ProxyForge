@@ -64,6 +64,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mpc-url",
+        default=MTGStrategy.MPC_DEFAULT_URL,
+        help=(
+            "MPC Autofill backend URL (mtg strategy only, primary source). "
+            f"Default: {MTGStrategy.MPC_DEFAULT_URL}."
+        ),
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=None,
+        help=(
+            "Resample every card to this resolution (e.g. 800, 300 for drafts). "
+            "Default: embed the downloaded images at their original quality."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -83,6 +100,7 @@ _STRATEGY_REGISTRY: dict[str, type[TCGStrategy]] = {
 def _make_strategy(
     name: str,
     local_dir: str | None,
+    mpc_url: str | None = None,
 ) -> TCGStrategy:
     cls = _STRATEGY_REGISTRY.get(name)
     if cls is None:
@@ -90,7 +108,7 @@ def _make_strategy(
     if cls is LorcanaStrategy:
         return LorcanaStrategy()
     if cls is MTGStrategy:
-        return MTGStrategy()
+        return MTGStrategy(mpc_url=mpc_url)
     if cls is LocalStrategy:
         return LocalStrategy(images_dir=local_dir)
     return cls()
@@ -116,12 +134,16 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Parsed deck '%s' with %d unique card entries.", deck_name, len(cards))
 
     try:
-        strategy = _make_strategy(args.tcg, args.local_dir)
+        strategy = _make_strategy(args.tcg, args.local_dir, args.mpc_url)
     except ValueError as exc:
         logger.error("%s", exc)
         return 2
 
-    exporter = Exporter(strategy=strategy, output_base_dir=args.output + f"/{args.tcg}")
+    exporter = Exporter(
+        strategy=strategy,
+        output_base_dir=args.output + f"/{args.tcg}",
+        target_dpi=args.dpi,
+    )
     try:
         pdf_path = exporter.export_deck(deck_name, cards)
     except Exception as exc:  # noqa: BLE001 - top-level CLI guard

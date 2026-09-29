@@ -49,12 +49,12 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
 | 🃏 **Lorcana** | Queries the **LorcanaJSON** API on every run, and falls back to scraping `lorcana.gg`; `[art]` decklist markers select the card art (default: most premium available) |
 | ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
-| 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) live on every run (exact + fuzzy name lookup, collector-number lookup, variant/base art search, high-res `png` imagery) with a search fallback and a final [Moxfield](https://moxfield.com) fallback; `[art]` decklist markers select set / variant / printing |
+| 🔮 **Magic: The Gathering** | Queries [MPC Autofill](https://mpcfill.com) first (community full-resolution imagery, by name), then the [Scryfall API](https://scryfall.com/docs/api) live on every run (exact + fuzzy name lookup, collector-number lookup, variant/base art search, high-res `png` imagery) with a search fallback and a final [Moxfield](https://moxfield.com) fallback; `[art]` decklist markers select set / variant / printing (honored by Scryfall, ignored by MPC) |
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
 | 👀 **Web preview** | Streamlit UI to review, fix and re-fetch card images before building the PDFs |
-| 🖨️ **Print-ready PDF** | Multi-page A4 grid at **800 DPI** with gutter, bleed and crop marks around every 63 x 88 mm card slot |
+| 🖨️ **Print-ready PDF** | Multi-page vector A4 grid that embeds every card at its **original resolution** (no resampling, no lossy re-encoding) with gutter, bleed and crop marks around every 63 x 88 mm card slot |
 
 ---
 
@@ -203,8 +203,9 @@ pip install -r requirements-web.txt
 streamlit run src/app.py
 ```
 
-The PDF resolution can be lowered in the sidebar (300 DPI) for quick test
-prints. Set `PROXYFORGE_OUTPUT_DIR` to change the default output folder.
+By default the PDF keeps the original image quality; the sidebar can
+resample the cards to 800 / 600 / 300 DPI for lighter files (300 DPI for
+quick test prints). Set `PROXYFORGE_OUTPUT_DIR` to change the default output folder.
 
 ---
 
@@ -216,6 +217,8 @@ prints. Set `PROXYFORGE_OUTPUT_DIR` to change the default output folder.
 | `--output` | `-o` | `/app/output` | Base output directory. |
 | `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`, `local`). |
 | `--local-dir` | | `input/images` | Directory with local card images (Local only). Card names in the decklist must match the local file names. |
+| `--mpc-url` | | `https://mpcfill.com` | MPC Autofill backend URL (MTG primary source). |
+| `--dpi` | | original | Resample every card to this DPI (e.g. `800`, `300` for drafts, high-quality JPEG). By default the PDF embeds the downloaded images as-is: JPEGs byte for byte, PNGs losslessly. |
 | `--verbose` | `-v` | off | Enable verbose logging. |
 
 ---
@@ -336,10 +339,27 @@ a set (+collector) + variant combo (the `[art]` set always wins over a
 
 ---
 
-## 🔮 Scryfall Lookup (Magic: The Gathering)
+## 🔮 MTG Lookup (Magic: The Gathering)
 
-The MTG strategy resolves each card live through the **Scryfall API**
+The MTG strategy tries **[MPC Autofill](https://mpcfill.com)** first
+(community print-ready imagery, searched by card name only — decklist set
+annotations and `[art]` markers are ignored here; DFC backs resolve via
+`GET /2/DFCPairs/`), then resolves live through the **Scryfall API**
 (`https://api.scryfall.com`) — nothing is cached on disk:
+
+> **Reproducible MPC images.** The MPC search ranks its hits by the order
+> of the server's sources, which changes as the community adds images, so
+> the "first hit" of a name may differ between runs. Every export therefore
+> writes `output/<tcg>/<deck>/<deck>.txt` with each MPC hit pinned as
+> `[mpc:<identifier>]` (double-faced backs become an explicit
+> `/ Back [mpc:<identifier>]`). Feed that file back as `--input` and the
+> exact same images are requested (`POST /2/cards/` by identifier, no
+> search). A pinned image that was removed from MPC falls back to the
+> name search.
+>
+> ```text
+> 1 Delver of Secrets [mpc:1k4w07AFcKua0ldRpmTgXx0pTsEGv4kxg] / Insectile Aberration [mpc:<identifier>]
+> ```
 
 1. `GET /cards/<set>/<collector>` — exact printing when the decklist pins
    one (`Lightning Bolt (2x2) 117`) or the `[art]` marker does (`[2x2:117]`).
@@ -363,7 +383,10 @@ The MTG strategy resolves each card live through the **Scryfall API**
    the same URL served by the "Download Image" button on
    `moxfield.com/cards/<id>-<name>` pages.
 
-Images are downloaded from the Scryfall image CDN in the highest-quality
+Images are downloaded from MPC Autofill at full resolution (the first
+community hit's Google Drive `downloadLink`, often 1200 DPI scans that the
+PDF embeds untouched).
+Scryfall fallbacks use its image CDN in the highest-quality
 `png` version (744 x 1040, transparent rounded corners); the remaining
 versions (`large`, `normal`, `border_crop`, `small`) act as fallbacks.
 Double-faced cards (transform, modal DFC...) resolve both faces from a
@@ -446,8 +469,8 @@ python src/main.py --input input/my_deck.txt --output output --tcg local \
 | Property | Value |
 | --- | --- |
 | Card size | 63 x 88 mm |
-| Print DPI | 800 |
-| Card pixels (at 800 DPI) | ~1984 x 2772 px |
+| Print resolution | Source image resolution (default) or `--dpi N` |
+| Card pixels | As downloaded (e.g. MPC 1200 DPI scans); `--dpi 800` → ~1984 x 2772 px |
 | Page size | A4 (210 x 297 mm) |
 | Grid | 3 x 3 (9 cards per page) |
 | Gutter | 3 mm |
@@ -509,8 +532,9 @@ python -m pytest -k lorcana               # tests matching a keyword
 | Module | Covers |
 | --- | --- |
 | `tests/test_exporter.py` | PDF generation: pagination, de-duplication, foil / double-sided split, automatic backs, skipped failures, image reuse |
+| `tests/test_pdf.py` | Vector PDF writer: JPEG / PNG pass-through, lossless conversion, resampling, xref table |
 | `tests/test_lorcana.py` | LorcanaJSON lookup, default / `[base]` art selection and `lorcana.gg` fallback |
-| `tests/test_mtg.py` | Scryfall collector-number and named lookups, double-faced backs and Moxfield fallback |
+| `tests/test_mtg.py` | MPC Autofill primary source, Scryfall collector-number and named lookups, double-faced backs and Moxfield fallback |
 | `tests/test_pokemon.py` | pkmncards.com search, best-match selection and card-page fallback |
 | `tests/test_local.py` | Local image resolution (exact, case-insensitive, with extension, missing files) |
 

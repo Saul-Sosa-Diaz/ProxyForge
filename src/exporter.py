@@ -6,10 +6,11 @@ import logging
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
-
-from PIL import Image, ImageDraw
+from typing import NamedTuple
 
 from .models import DeckCard, ResolvedCard
+from .parser import format_deck
+from .pdf import PdfWriter, draw_image_ops, line_ops
 from .strategies.base import TCGStrategy
 
 logger = logging.getLogger(__name__)
@@ -19,13 +20,14 @@ logger = logging.getLogger(__name__)
 CARD_WIDTH_MM = 63.0
 CARD_HEIGHT_MM = 88.0
 
-# Print resolution.
+# Print resolution. By default the PDF embeds every card at its source
+# resolution (``target_dpi=None``); a DPI resamples the cards to that
+# resolution instead (smaller files, e.g. PRINT_DPI or 300 for drafts).
 PRINT_DPI = 800
 MM_PER_INCH = 25.4
-
-# Card pixel size at the default 800 DPI (63x88 mm -> ~1984x2772 px).
-CARD_WIDTH_PX = round(CARD_WIDTH_MM * PRINT_DPI / MM_PER_INCH)  # 1984
-CARD_HEIGHT_PX = round(CARD_HEIGHT_MM * PRINT_DPI / MM_PER_INCH)  # 2772
+POINTS_PER_INCH = 72.0
+# How far bleed strips reach under the card so no hairline shows between them.
+_BLEED_OVERLAP_PT = 0.5
 
 # Professional cut geometry: gutter between cards, mirrored-edge bleed and
 # trim (crop) marks placed in the outer margins of the sheet.
@@ -51,11 +53,12 @@ CARD_GAP_MM = 3.0
 class Exporter:
     """Download unique card images and assemble a print-ready PDF grid.
 
-    The PDF is rendered as a high-resolution raster at ``target_dpi`` so that
-    each 63x88 mm card slot measures exactly ``CARD_WIDTH_PX x CARD_HEIGHT_PX``
-    pixels (e.g. 1984x2772 px at 800 DPI). When Pillow saves the page with
-    ``resolution=target_dpi`` the resulting MediaBox is the true physical page
-    size (A4 = 595x842 pt), so every card prints at exactly 63x88 mm.
+    The PDF is vector: pages measure the true physical size (A4 = 595x842
+    pt) and each card image is placed at exactly 63x88 mm. By default
+    (``target_dpi=None``) the downloaded file is embedded without resampling
+    or lossy re-encoding (see :mod:`src.pdf`), so the print gets every pixel
+    of the source (e.g. 1200 DPI MPC Autofill scans). An explicit
+    ``target_dpi`` resamples each card to that resolution for smaller files.
 
     Professional sheet layout: cards are separated by a ``card_gap_mm``
     gutter and rendered at exactly 63x88 mm (never rescaled beyond that
@@ -75,7 +78,7 @@ class Exporter:
         page_height_mm: float = PAGE_HEIGHT_MM,
         page_margin_mm: float = PAGE_MARGIN_MM,
         card_gap_mm: float = CARD_GAP_MM,
-        target_dpi: int = PRINT_DPI,
+        target_dpi: int | None = None,
     ) -> None:
         self.strategy = strategy
         self.output_base = Path(output_base_dir)
@@ -85,21 +88,35 @@ class Exporter:
         self.card_gap_mm = card_gap_mm
         self.target_dpi = target_dpi
 
-    def _mm_to_px(self, value_mm: float) -> float:
-        return value_mm * self.target_dpi / MM_PER_INCH
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def export_deck(self, deck_name: str, cards: list[DeckCard]) -> Path:
         """Download images and build the PDFs in one go (CLI entry point).
 
-        Equivalent to :meth:`resolve_images` followed by :meth:`render_pdfs`.
+        Equivalent to :meth:`resolve_images` followed by :meth:`save_decklist`
+        and :meth:`render_pdfs`.
 
         Returns:
             The first PDF written (see :meth:`render_pdfs` for the order).
         """
-        return self.render_pdfs(deck_name, self.resolve_images(deck_name, cards))[0]
+        resolved = self.resolve_images(deck_name, cards)
+        self.save_decklist(deck_name, resolved)
+        return self.render_pdfs(deck_name, resolved)[0]
+
+    def save_decklist(self, deck_name: str, resolved: list[ResolvedCard]) -> Path:
+        """Write ``<output>/<deck_name>/<deck_name>.txt`` with the pinned arts.
+
+        The entries carry the ``[art]`` markers chosen by
+        :meth:`TCGStrategy.pin_art` (e.g. ``[mpc:<identifier>]``), so
+        feeding this file back as ``--input`` downloads the same images.
+        """
+        deck_dir = self.output_base / deck_name
+        deck_dir.mkdir(parents=True, exist_ok=True)
+        path = deck_dir / f"{deck_name}.txt"
+        path.write_text(format_deck(item.card for item in resolved), encoding="utf-8")
+        logger.info("Pinned decklist written to %s", path)
+        return path
 
     def resolve_images(
         self,
@@ -275,8 +292,10 @@ class Exporter:
 
         A failed front download leaves the entry without images (its back
         has no slot to align to); a failed back download degrades to a
-        blank back slot.
+        blank back slot. The returned card carries the pinned ``[art]``
+        markers (see :meth:`_pin_card`).
         """
+        card = self._pin_card(card)
         front_path = self._fetch_single_image(card.name, card.art, images_dir, unique)
         if front_path is None:
             return ResolvedCard(card=card)
@@ -294,6 +313,26 @@ class Exporter:
                 card.name,
             )
         return ResolvedCard(card=card, front_path=front_path, back_path=back_path)
+
+    def _pin_card(self, card: DeckCard) -> DeckCard:
+        """Replace each face's ``[art]`` with the one pinned by the strategy.
+
+        An automatic back the strategy can pin becomes an explicit
+        ``/ Back [art]`` so the saved decklist reproduces it as well.
+        """
+        update: dict[str, str | None] = {}
+        art = self.strategy.pin_art(card.name, card.art)
+        if art != card.art:
+            update["art"] = art
+        if card.back_name:
+            back_art = self.strategy.pin_art(card.back_name, card.back_art)
+            if back_art != card.back_art:
+                update["back_art"] = back_art
+        else:
+            back = self.strategy.pin_back(card.name, art)
+            if back is not None:
+                update["back_name"], update["back_art"] = back
+        return card.model_copy(update=update) if update else card
 
     def _fetch_automatic_back(
         self,
@@ -365,56 +404,48 @@ class Exporter:
     # ------------------------------------------------------------------
     # PDF assembly
     # ------------------------------------------------------------------
-    def _page_geometry(self) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
-        """Compute shared raster geometry so front/back PDFs coincide exactly.
+    def _page_geometry(self) -> _Geometry:
+        """Compute shared page geometry so front/back PDFs coincide exactly.
 
-        Returns ``(cols, rows, per_page, page_w_px, page_h_px, card_w_px,
-        card_h_px, gap_px, bleed_px, start_x, start_y)``. Both front and
-        back builders must use this single source so every 63x88 mm slot,
-        gutter, margin and crop mark lands on the same physical coordinates.
+        Every value is in PDF points (1/72 inch) measured from the top-left
+        corner of the page. Both front and back builders must use this
+        single source so every 63x88 mm slot, gutter, margin and crop mark
+        lands on the same physical coordinates.
         """
         cols, rows = self._compute_grid()
-        per_page = cols * rows
-        page_w_px = round(self._mm_to_px(self.page_width_mm))
-        page_h_px = round(self._mm_to_px(self.page_height_mm))
-        card_w_px = round(self._mm_to_px(CARD_WIDTH_MM))
-        card_h_px = round(self._mm_to_px(CARD_HEIGHT_MM))
-        gap_px = round(self._mm_to_px(self.card_gap_mm))
+        card_w = _mm_to_pt(CARD_WIDTH_MM)
+        card_h = _mm_to_pt(CARD_HEIGHT_MM)
+        gap = _mm_to_pt(self.card_gap_mm)
+        page_w = _mm_to_pt(self.page_width_mm)
+        page_h = _mm_to_pt(self.page_height_mm)
         # Bleed must never overrun the gutter (a white strip has to remain
         # between adjacent cards) nor the page margin (outer bleed stays on
         # the sheet).
-        bleed_mm = min(BLEED_MM, self.card_gap_mm / 2.0, self.page_margin_mm)
-        bleed_px = round(self._mm_to_px(bleed_mm))
-
+        bleed = _mm_to_pt(min(BLEED_MM, self.card_gap_mm / 2.0, self.page_margin_mm))
         # Center the grid block on the page so outer crop marks always sit
         # inside the sheet (never clipped at the page edge).
-        block_w_px = cols * card_w_px + (cols - 1) * gap_px
-        block_h_px = rows * card_h_px + (rows - 1) * gap_px
-        start_x = round((page_w_px - block_w_px) / 2)
-        start_y = round((page_h_px - block_h_px) / 2)
-        return (
-            cols,
-            rows,
-            per_page,
-            page_w_px,
-            page_h_px,
-            card_w_px,
-            card_h_px,
-            gap_px,
-            bleed_px,
-            start_x,
-            start_y,
+        block_w = cols * card_w + (cols - 1) * gap
+        block_h = rows * card_h + (rows - 1) * gap
+        return _Geometry(
+            cols=cols,
+            rows=rows,
+            page_w=page_w,
+            page_h=page_h,
+            card_w=card_w,
+            card_h=card_h,
+            gap=gap,
+            bleed=bleed,
+            start_x=(page_w - block_w) / 2,
+            start_y=(page_h - block_h) / 2,
         )
 
-    def _save_pages(self, page_images: list[Image.Image], pdf_path: Path) -> None:
-        if not page_images:
-            raise RuntimeError("No images available to build the PDF.")
-        page_images[0].save(
-            str(pdf_path),
-            "PDF",
-            resolution=self.target_dpi,
-            save_all=True,
-            append_images=page_images[1:],
+    def _image_size(self) -> tuple[int, int] | None:
+        """Pixel size cards are resampled to (``None`` = source pixels)."""
+        if self.target_dpi is None:
+            return None
+        return (
+            round(CARD_WIDTH_MM * self.target_dpi / MM_PER_INCH),
+            round(CARD_HEIGHT_MM * self.target_dpi / MM_PER_INCH),
         )
 
     def _build_pdf(
@@ -439,46 +470,20 @@ class Exporter:
         """Render front pages in natural order (no mirroring)."""
         if not front_slots:
             raise RuntimeError("No images available to build the PDF.")
-        (
-            cols,
-            rows,
-            per_page,
-            page_w_px,
-            page_h_px,
-            card_w_px,
-            card_h_px,
-            gap_px,
-            bleed_px,
-            start_x,
-            start_y,
-        ) = self._page_geometry()
-
-        page_images: list[Image.Image] = []
+        geo = self._page_geometry()
+        per_page = geo.cols * geo.rows
+        writer = PdfWriter()
         for page_start in range(0, len(front_slots), per_page):
             page_slots = front_slots[page_start : page_start + per_page]
-            page = Image.new("RGB", (page_w_px, page_h_px), "white")
-            draw = ImageDraw.Draw(page)
+            ops: list[str] = []
             for idx, slot_path in enumerate(page_slots):
-                col = idx % cols
-                row = idx // cols
-                x = start_x + col * (card_w_px + gap_px)
-                y = start_y + row * (card_h_px + gap_px)
-                self._paste_card(page, slot_path, x, y, card_w_px, card_h_px, bleed_px)
+                col = idx % geo.cols
+                row = idx // geo.cols
+                ops.append(self._card_ops(writer, geo, slot_path, col, row))
             # Trim (crop) marks in the outer margins, one tick per card edge.
-            self._draw_crop_marks(
-                draw,
-                start_x,
-                start_y,
-                cols,
-                rows,
-                card_w_px,
-                card_h_px,
-                gap_px,
-                bleed_px,
-            )
-            page_images.append(page)
-
-        self._save_pages(page_images, pdf_path)
+            ops.append(self._crop_mark_ops(geo))
+            writer.add_page(geo.page_w, geo.page_h, "\n".join(ops))
+        writer.save(pdf_path)
 
     def _build_back_pages(
         self,
@@ -500,19 +505,8 @@ class Exporter:
         """
         if not back_slots or not any(b is not None for b in back_slots):
             raise RuntimeError("No back images available to build the back PDF.")
-        (
-            cols,
-            rows,
-            per_page,
-            page_w_px,
-            page_h_px,
-            card_w_px,
-            card_h_px,
-            gap_px,
-            bleed_px,
-            start_x,
-            start_y,
-        ) = self._page_geometry()
+        geo = self._page_geometry()
+        per_page = geo.cols * geo.rows
 
         # Split into pages and drop trailing fully-blank ones so the back
         # PDF never ends with (nor, combined with backs-first ordering,
@@ -527,33 +521,19 @@ class Exporter:
         if not pages:
             raise RuntimeError("No back images available to build the back PDF.")
 
-        page_images: list[Image.Image] = []
+        writer = PdfWriter()
         for page_slots in pages:
-            page = Image.new("RGB", (page_w_px, page_h_px), "white")
-            draw = ImageDraw.Draw(page)
+            ops: list[str] = []
             for idx, slot_path in enumerate(page_slots):
                 if slot_path is None or not slot_path.exists():
                     continue  # single-sided front -> blank back keeps alignment
-                col = idx % cols
-                row = idx // cols
-                mirror_col = (cols - 1) - col
-                x = start_x + mirror_col * (card_w_px + gap_px)
-                y = start_y + row * (card_h_px + gap_px)
-                self._paste_card(page, slot_path, x, y, card_w_px, card_h_px, bleed_px)
-            self._draw_crop_marks(
-                draw,
-                start_x,
-                start_y,
-                cols,
-                rows,
-                card_w_px,
-                card_h_px,
-                gap_px,
-                bleed_px,
-            )
-            page_images.append(page)
-
-        self._save_pages(page_images, pdf_path)
+                col = idx % geo.cols
+                row = idx // geo.cols
+                mirror_col = (geo.cols - 1) - col
+                ops.append(self._card_ops(writer, geo, slot_path, mirror_col, row))
+            ops.append(self._crop_mark_ops(geo))
+            writer.add_page(geo.page_w, geo.page_h, "\n".join(ops))
+        writer.save(pdf_path)
 
     def _flatten_slots(self, expanded: Iterable[tuple[Path, int]]) -> list[Path]:
         """Expand ``(image_path, quantity)`` into a flat list of per-card slots."""
@@ -576,136 +556,115 @@ class Exporter:
         rows = max(1, int((usable_h + self.card_gap_mm) // cell_h))
         return cols, rows
 
-    def _paste_card(
+    def _card_ops(
         self,
-        page: Image.Image,
+        writer: PdfWriter,
+        geo: _Geometry,
         slot_path: Path,
-        x_px: int,
-        y_px: int,
-        card_w_px: int,
-        card_h_px: int,
-        bleed_px: int,
-    ) -> None:
-        """Paste a card at its exact nominal size with mirrored-edge bleed.
+        col: int,
+        row: int,
+    ) -> str:
+        """Operators placing one card in grid slot ``(col, row)`` with bleed.
 
-        The card artwork itself is rendered at exactly ``card_w_px x
-        card_h_px`` (63x88 mm, never enlarged). The bleed strip that extends
-        ``bleed_px`` into the gutter is a mirrored copy of the artwork's
-        outer edge, so the trim line (where the crop marks point) coincides
-        exactly with the visible card edge.
+        The card image is stretched to exactly 63x88 mm at its source
+        resolution (the printer does the only resampling). The bleed strip
+        that extends ``bleed`` into the gutter redraws the same image
+        mirrored around each card edge and clipped to the strip, so the
+        trim line (where the crop marks point) coincides exactly with the
+        visible card edge.
         """
-        with Image.open(slot_path) as src:
-            src = src.convert("RGB")
-            if src.size != (card_w_px, card_h_px):
-                src = src.resize((card_w_px, card_h_px), Image.LANCZOS)
-            if bleed_px <= 0:
-                page.paste(src, (x_px, y_px))
-                return
+        name = writer.add_image(slot_path, self._image_size())
+        w, h, b = geo.card_w, geo.card_h, geo.bleed
+        x = geo.start_x + col * (w + geo.gap)
+        # PDF user space starts at the bottom-left corner of the page.
+        y = geo.page_h - (geo.start_y + row * (h + geo.gap)) - h
+        ops: list[str] = []
+        if b > 0:
+            # Strips reach _BLEED_OVERLAP_PT under the card so no hairline
+            # gap shows between them; the card itself is drawn on top.
+            o = _BLEED_OVERLAP_PT
+            strips = (
+                # (clip x, clip y, clip w, clip h), (a, d, e, f) of [a 0 0 d e f]
+                ((x - b, y, b + o, h), (-w, h, x, y)),  # left, mirrored X
+                ((x + w - o, y, b + o, h), (-w, h, x + 2 * w, y)),  # right
+                ((x, y - b, w, b + o), (w, -h, x, y)),  # bottom, mirrored Y
+                ((x, y + h - o, w, b + o), (w, -h, x, y + 2 * h)),  # top
+                ((x - b, y - b, b + o, b + o), (-w, -h, x, y)),  # corners: both
+                ((x + w - o, y - b, b + o, b + o), (-w, -h, x + 2 * w, y)),
+                ((x - b, y + h - o, b + o, b + o), (-w, -h, x, y + 2 * h)),
+                ((x + w - o, y + h - o, b + o, b + o), (-w, -h, x + 2 * w, y + 2 * h)),
+            )
+            for clip, (a, d, e, f) in strips:
+                ops.append(draw_image_ops(name, (a, 0, 0, d, e, f), clip))
+        ops.append(draw_image_ops(name, (w, 0, 0, h, x, y)))
+        return "\n".join(ops)
 
-            b = bleed_px
-            w, h = card_w_px, card_h_px
-            canvas = Image.new("RGB", (w + 2 * b, h + 2 * b))
-            canvas.paste(src, (b, b))
-            # Edge strips mirrored into the gutter (left, right, top, bottom).
-            canvas.paste(
-                src.crop((0, 0, b, h)).transpose(Image.FLIP_LEFT_RIGHT), (0, b)
-            )
-            canvas.paste(
-                src.crop((w - b, 0, w, h)).transpose(Image.FLIP_LEFT_RIGHT), (b + w, b)
-            )
-            canvas.paste(
-                src.crop((0, 0, w, b)).transpose(Image.FLIP_TOP_BOTTOM), (b, 0)
-            )
-            canvas.paste(
-                src.crop((0, h - b, w, h)).transpose(Image.FLIP_TOP_BOTTOM), (b, b + h)
-            )
-            # Corner squares mirrored diagonally.
-            canvas.paste(src.crop((0, 0, b, b)).transpose(Image.ROTATE_180), (0, 0))
-            canvas.paste(
-                src.crop((w - b, 0, w, b)).transpose(Image.ROTATE_180), (b + w, 0)
-            )
-            canvas.paste(
-                src.crop((0, h - b, b, h)).transpose(Image.ROTATE_180), (0, b + h)
-            )
-            canvas.paste(
-                src.crop((w - b, h - b, w, h)).transpose(Image.ROTATE_180),
-                (b + w, b + h),
-            )
-            page.paste(canvas, (x_px - b, y_px - b))
-
-    def _draw_crop_marks(
-        self,
-        draw: ImageDraw.ImageDraw,
-        start_x: int,
-        start_y: int,
-        cols: int,
-        rows: int,
-        card_w_px: int,
-        card_h_px: int,
-        gap_px: int,
-        bleed_px: int,
-    ) -> None:
-        """Draw trim (crop) marks in the outer margins of the sheet.
+    def _crop_mark_ops(self, geo: _Geometry) -> str:
+        """Operators drawing trim (crop) marks in the outer margins.
 
         Every card edge is projected into the top/bottom (vertical cuts) and
-        left/right (horizontal cuts) margins as a short tick pointing
+        left/right (horizontal cuts) margins as a short vector tick pointing
         exactly at the card edge, so a guillotine cut aligned with a tick
         trims the card to precisely 63x88 mm. At the block corners the
         perpendicular ticks form a cut cross for the corner card.
         """
-        lw = max(1, round(self._mm_to_px(CROP_MARK_THICKNESS_MM)))
-        mark_len = round(self._mm_to_px(CROP_MARK_LENGTH_MM))
-        off = bleed_px  # keep the clean margin free of artwork and marks overlap
+        mark_len = _mm_to_pt(CROP_MARK_LENGTH_MM)
+        off = geo.bleed  # keep the clean margin free of artwork and marks overlap
+        pitch_x = geo.card_w + geo.gap
+        pitch_y = geo.card_h + geo.gap
 
-        pitch_x = card_w_px + gap_px
-        pitch_y = card_h_px + gap_px
+        # Nominal trim positions (PDF coordinates): left/right edge of every
+        # column, top/bottom edge of every row (with a gutter each card owns
+        # its own trim line).
+        xs: list[float] = []
+        for c in range(geo.cols):
+            left = geo.start_x + c * pitch_x
+            xs.extend((left, left + geo.card_w))
+        ys: list[float] = []
+        for r in range(geo.rows):
+            top = geo.page_h - (geo.start_y + r * pitch_y)
+            ys.extend((top, top - geo.card_h))
 
-        # Nominal trim positions: left/right edge of every column, top/bottom
-        # edge of every row (with a gutter each card owns its own trim line).
-        xs: list[int] = []
-        for c in range(cols):
-            left = start_x + c * pitch_x
-            xs.extend((left, left + card_w_px))
-        ys: list[int] = []
-        for r in range(rows):
-            top = start_y + r * pitch_y
-            ys.extend((top, top + card_h_px))
+        block_left = geo.start_x
+        block_right = geo.start_x + geo.cols * pitch_x - geo.gap
+        block_top = geo.page_h - geo.start_y
+        block_bottom = block_top - (geo.rows * pitch_y - geo.gap)
 
-        block_left = start_x
-        block_right = start_x + cols * pitch_x - gap_px  # last column right edge
-        block_top = start_y
-        block_bottom = start_y + rows * pitch_y - gap_px  # last row bottom edge
-
+        r, g, b = (c / 255 for c in CROP_MARK_COLOR)
+        ops = [f"{r:g} {g:g} {b:g} RG {_mm_to_pt(CROP_MARK_THICKNESS_MM):.4f} w 0 J"]
         # Vertical cut ticks in the top and bottom margins.
         for x in xs:
-            draw.line(
-                [(x, block_top - off - mark_len), (x, block_top - off)],
-                fill=CROP_MARK_COLOR,
-                width=lw,
-            )
-            draw.line(
-                [(x, block_bottom + off), (x, block_bottom + off + mark_len)],
-                fill=CROP_MARK_COLOR,
-                width=lw,
-            )
-
+            ops.append(line_ops(x, block_top + off, x, block_top + off + mark_len))
+            ops.append(line_ops(x, block_bottom - off, x, block_bottom - off - mark_len))
         # Horizontal cut ticks in the left and right margins.
         for y in ys:
-            draw.line(
-                [(block_left - off - mark_len, y), (block_left - off, y)],
-                fill=CROP_MARK_COLOR,
-                width=lw,
-            )
-            draw.line(
-                [(block_right + off, y), (block_right + off + mark_len, y)],
-                fill=CROP_MARK_COLOR,
-                width=lw,
-            )
+            ops.append(line_ops(block_left - off - mark_len, y, block_left - off, y))
+            ops.append(line_ops(block_right + off, y, block_right + off + mark_len, y))
+        return "\n".join(ops)
+
+
+class _Geometry(NamedTuple):
+    """Page layout in PDF points, measured from the page's top-left corner."""
+
+    cols: int
+    rows: int
+    page_w: float
+    page_h: float
+    card_w: float
+    card_h: float
+    gap: float
+    bleed: float
+    start_x: float
+    start_y: float
 
 
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+def _mm_to_pt(value_mm: float) -> float:
+    return value_mm * POINTS_PER_INCH / MM_PER_INCH
+
+
 def _sanitize_filename(name: str) -> str:
     cleaned = re.sub(r"[^\w\s()-]", "", name)
     cleaned = re.sub(r"\s+", "_", cleaned.strip())

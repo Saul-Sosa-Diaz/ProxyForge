@@ -82,6 +82,28 @@ class FakeSession:
                 return response
         return FakeResponse(status_code=404)
 
+    def post(self, url: str, json=None, data=None, **kwargs) -> FakeResponse:
+        """Fake ``requests.Session.post`` (MPC Autofill uses POST + JSON body).
+
+        The request key is the URL plus the JSON payload, so routes match by
+        URL substring (e.g. ``"editorSearch"``) exactly like :meth:`get`.
+        """
+        import json as _json
+
+        key = url
+        if json is not None:
+            try:
+                key += "?" + _json.dumps(json, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                key += "?" + str(json)
+        elif data is not None:
+            key += "?" + str(data)
+        self.calls.append(key)
+        for pattern, response in self.routes.items():
+            if pattern in key:
+                return response
+        return FakeResponse(status_code=404)
+
     head = get
 
 

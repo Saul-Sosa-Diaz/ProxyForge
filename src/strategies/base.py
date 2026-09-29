@@ -80,6 +80,39 @@ class TCGStrategy(ABC):
         """
         return False
 
+    def pin_art(self, card_name: str, art: str | None = None) -> str | None:
+        """Turn an ``[art]`` request into the marker of the exact image it yields.
+
+        Called by the exporter before downloading so the decklist it writes
+        back reproduces the same image on later runs, even when the source
+        would rank its results differently (e.g. MPC Autofill search). The
+        default keeps ``art`` unchanged. Must not raise.
+
+        Args:
+            card_name: Full name of the card, as written in the decklist.
+            art: Requested ``[art]`` marker (``None`` for the default art).
+
+        Returns:
+            The ``[art]`` marker to download and persist.
+        """
+        return art
+
+    def pin_back(self, card_name: str, art: str | None = None) -> tuple[str, str | None] | None:
+        """Pin the automatic back face of a card as an explicit ``/ Back``.
+
+        Lets the exporter write ``Front [art] / Back [back_art]`` so the
+        automatic back (see :meth:`fetch_card_back_image`) is also
+        reproducible. The default pins nothing. Must not raise.
+
+        Args:
+            card_name: Full name of the front card.
+            art: Front ``[art]`` marker already returned by :meth:`pin_art`.
+
+        Returns:
+            ``(back_name, back_art)``, or ``None`` to keep the automatic back.
+        """
+        return None
+
     def list_art_options(self, card_name: str) -> list[ArtOption]:
         """List the arts available for a card (web UI art picker).
 

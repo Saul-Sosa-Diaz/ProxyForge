@@ -1,8 +1,9 @@
-"""Tests for MTGStrategy with Scryfall and Moxfield mocked from fixture JSON."""
+"""Tests for MTGStrategy with MPC Autofill (primary), Scryfall and Moxfield mocked from fixture JSON."""
 from __future__ import annotations
 
 from mocks import FakeResponse, FakeSession, deck, image_response, response_json
-from src.parser import parse_deck_file
+from src.exporter import Exporter
+from src.parser import parse_deck_file, parse_deck_text
 from src.strategies.mtg import MTGStrategy
 
 
@@ -15,6 +16,15 @@ def _strategy(routes):
 
 def _json(name):
     return FakeResponse(json_data=response_json(name))
+
+
+def _mpc_routes():
+    return {
+        "2/sources": _json("mpc_sources.json"),
+        "editorSearch": _json("mpc_editor_search.json"),
+        "2/cards": _json("mpc_cards.json"),
+        "2/DFCPairs": _json("mpc_dfc_pairs.json"),
+    }
 
 
 def test_fixture_deck_is_parsed():
@@ -57,6 +67,117 @@ def test_falls_back_to_moxfield(tmp_path):
 def test_not_found_returns_false(tmp_path):
     strategy = _strategy({})
     assert not strategy.fetch_card_image("Unknown Card", str(tmp_path / "u.png"))
+
+
+def test_mpc_primary_source(tmp_path):
+    strategy = _strategy(_mpc_routes())
+
+    assert strategy.fetch_card_image("Lightning Bolt", str(tmp_path / "l.png"))
+
+    assert "https://img.test/mpc-full.png" in strategy._session.calls
+    assert not any("/cards/named" in call for call in strategy._session.calls)
+
+
+def test_mpc_ignores_art_marker(tmp_path):
+    strategy = _strategy(_mpc_routes())
+
+    assert strategy.fetch_card_image(
+        "Lightning Bolt", str(tmp_path / "l.png"), art="m21 borderless"
+    )
+
+    assert "https://img.test/mpc-full.png" in strategy._session.calls
+    assert not any("/cards/search" in call for call in strategy._session.calls)
+
+
+def test_mpc_miss_falls_back_to_scryfall(tmp_path):
+    strategy = _strategy({
+        "2/sources": _json("mpc_sources.json"),
+        "editorSearch": _json("mpc_editor_search_empty.json"),
+        "/cards/named?exact=Lightning Bolt": _json("mtg_dark_leo.json"),
+    })
+
+    assert strategy.fetch_card_image("Lightning Bolt", str(tmp_path / "l.png"))
+
+    assert "https://img.test/dark-leo.png" in strategy._session.calls
+
+
+def test_mpc_back_image(tmp_path):
+    strategy = _strategy(_mpc_routes())
+
+    assert strategy.fetch_card_image("Delver of Secrets", str(tmp_path / "front.png"))
+    assert strategy.fetch_card_back_image("Delver of Secrets", str(tmp_path / "back.png"))
+
+    assert "https://img.test/mpc-front-full.png" in strategy._session.calls
+    assert "https://img.test/mpc-back-full.png" in strategy._session.calls
+
+
+def test_pin_art_returns_mpc_identifier(tmp_path):
+    strategy = _strategy(_mpc_routes())
+
+    assert strategy.pin_art("Lightning Bolt (2X2) 117", "m21") == "mpc:mpc-id-1"
+    assert strategy.pin_art("Delver of Secrets") == "mpc:mpc-front-1"
+    assert strategy.pin_back("Delver of Secrets", "mpc:mpc-front-1") == (
+        "Insectile Aberration",
+        "mpc:mpc-back-1",
+    )
+    assert strategy.pin_back("Lightning Bolt", "mpc:mpc-id-1") is None
+
+
+def test_pin_art_keeps_marker_when_mpc_misses(tmp_path):
+    strategy = _strategy({
+        "2/sources": _json("mpc_sources.json"),
+        "editorSearch": _json("mpc_editor_search_empty.json"),
+    })
+
+    assert strategy.pin_art("Lightning Bolt", "m21") == "m21"
+    assert strategy.pin_back("Lightning Bolt", "m21") is None
+
+
+def test_pinned_mpc_art_skips_search(tmp_path):
+    routes = _mpc_routes()
+    # The search ranking changed since the card was pinned.
+    routes["editorSearch"] = FakeResponse(
+        json_data={"results": {"lightning bolt": {"CARD": ["mpc-id-2", "mpc-id-1"]}}}
+    )
+    strategy = _strategy(routes)
+
+    assert strategy.fetch_card_image("Lightning Bolt", str(tmp_path / "l.png"), art="mpc:mpc-id-1")
+
+    assert "https://img.test/mpc-full.png" in strategy._session.calls
+    assert not any("editorSearch" in call for call in strategy._session.calls)
+
+
+def test_missing_pinned_mpc_card_falls_back_to_search(tmp_path):
+    strategy = _strategy(_mpc_routes())
+
+    assert strategy.fetch_card_image("Delver of Secrets", str(tmp_path / "d.png"), art="mpc:gone-card-id")
+
+    assert "https://img.test/mpc-front-full.png" in strategy._session.calls
+
+
+def test_saved_decklist_reproduces_mpc_images(tmp_path):
+    cards = parse_deck_text("2 Lightning Bolt (2X2) 117 *F*\n1 Delver of Secrets\n")
+    exporter = Exporter(_strategy(_mpc_routes()), str(tmp_path / "first"), target_dpi=50)
+    exporter.export_deck("deck", cards)
+
+    saved = (tmp_path / "first" / "deck" / "deck.txt").read_text(encoding="utf-8")
+    assert saved == (
+        "2 Lightning Bolt (2X2) 117 [mpc:mpc-id-1] *F*\n"
+        "1 Delver of Secrets [mpc:mpc-front-1] / Insectile Aberration [mpc:mpc-back-1]\n"
+    )
+
+    # Re-run from the saved decklist once MPC ranks other images first.
+    routes = _mpc_routes()
+    routes["editorSearch"] = FakeResponse(json_data={"results": {}})
+    strategy = _strategy(routes)
+    rerun = Exporter(strategy, str(tmp_path / "second"), target_dpi=50)
+    rerun.export_deck("deck", parse_deck_text(saved))
+
+    calls = strategy._session.calls
+    assert not any("editorSearch" in call for call in calls)
+    for url in ("mpc-full.png", "mpc-front-full.png", "mpc-back-full.png"):
+        assert f"https://img.test/{url}" in calls
+    assert (tmp_path / "second" / "deck" / "deck.txt").read_text(encoding="utf-8") == saved
 
 
 def test_list_art_options_lists_printings(tmp_path):

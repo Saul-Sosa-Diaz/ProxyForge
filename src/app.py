@@ -44,7 +44,8 @@ logger = logging.getLogger("tcg-downloader.web")
 
 DEFAULT_OUTPUT_DIR = os.environ.get("PROXYFORGE_OUTPUT_DIR", "output")
 DEFAULT_DECK_NAME = "mazo"
-DPI_OPTIONS = (PRINT_DPI, 600, 300)
+# None = original images (maximum quality); a DPI resamples to smaller files.
+DPI_OPTIONS = (None, PRINT_DPI, 600, 300)
 GRID_COLUMNS = 4
 ART_GRID_COLUMNS = 4
 ART_OPTIONS_PER_PAGE = 12
@@ -156,7 +157,7 @@ def _get_strategy(ctx: _Context) -> TCGStrategy:
     return st.session_state.strategy
 
 
-def _get_exporter(ctx: _Context, dpi: int = PRINT_DPI) -> Exporter:
+def _get_exporter(ctx: _Context, dpi: int | None = None) -> Exporter:
     return Exporter(
         strategy=_get_strategy(ctx),
         output_base_dir=str(Path(ctx.output_dir) / ctx.tcg),
@@ -207,7 +208,7 @@ def _zip_files(paths: list[Path]) -> bytes:
 # --- Page sections ---------------------------------------------------------
 
 
-def _render_sidebar() -> tuple[_Context, int]:
+def _render_sidebar() -> tuple[_Context, int | None]:
     with st.sidebar:
         st.header("Ajustes")
         tcg = st.selectbox(
@@ -226,7 +227,11 @@ def _render_sidebar() -> tuple[_Context, int]:
         dpi = st.selectbox(
             "Resolución del PDF (DPI)",
             DPI_OPTIONS,
-            help="800 DPI es la calidad de impresión; 300 genera PDFs mucho más rápidos.",
+            format_func=lambda dpi: "Original (máxima calidad)" if dpi is None else f"{dpi} DPI",
+            help=(
+                "Original incrusta cada imagen descargada sin reescalar ni recomprimir; "
+                "un DPI fijo genera PDFs más ligeros (300 para borradores)."
+            ),
         )
     return _Context(tcg=tcg, local_dir=local_dir, output_dir=output_dir), dpi
 
@@ -475,7 +480,7 @@ def _render_card_grid(
                 _render_card(index, item, ctx, deck_name, pair_number)
 
 
-def _render_preview(current: _Context, dpi: int) -> None:
+def _render_preview(current: _Context, dpi: int | None) -> None:
     resolved: list[ResolvedCard] = st.session_state.resolved
     ctx: _Context = st.session_state.context
     deck_name: str = st.session_state.deck_name
@@ -541,7 +546,7 @@ def _render_preview(current: _Context, dpi: int) -> None:
             _render_card_grid(failed, ctx, deck_name, dual=False)
 
 
-def _render_pdf_actions(dpi: int, has_cards: bool) -> None:
+def _render_pdf_actions(dpi: int | None, has_cards: bool) -> None:
     resolved: list[ResolvedCard] = st.session_state.resolved
     ctx: _Context = st.session_state.context
     deck_name: str = st.session_state.deck_name
@@ -550,7 +555,8 @@ def _render_pdf_actions(dpi: int, has_cards: bool) -> None:
     generate_col, txt_col, zip_col = st.columns(3)
     if generate_col.button("🖨️ Generar PDFs", type="primary", disabled=not has_cards):
         try:
-            with st.spinner(f"Generando PDFs a {dpi} DPI…"):
+            quality = "calidad original" if dpi is None else f"{dpi} DPI"
+            with st.spinner(f"Generando PDFs ({quality})…"):
                 pdfs = _get_exporter(ctx, dpi).render_pdfs(deck_name, resolved)
             decklist_file = pdfs[0].parent / f"{deck_name}.txt"
             decklist_file.write_text(decklist, encoding="utf-8")

@@ -43,5 +43,15 @@ def test_format_deck_round_trips():
     assert parse_deck_text(format_deck(cards)) == cards
 
 
+def test_mpc_marker_keeps_identifier_case():
+    text = "1 Delver of Secrets [mpc:1k4w07AFcKua0ldRpmTgXx0pTsEGv4kxg] *F* / Insectile Aberration [MPC:1H9E_z-Y]\n"
+    card = parse_deck_text(text)[0]
+
+    assert card.art == "mpc:1k4w07AFcKua0ldRpmTgXx0pTsEGv4kxg"
+    assert card.back_art == "mpc:1H9E_z-Y"
+    assert card.foil
+    assert format_deck([card]) == text.replace("MPC:", "mpc:")
+
+
 def test_format_deck_line_minimal():
     assert format_deck_line(DeckCard(quantity=2, name="Island")) == "2 Island"

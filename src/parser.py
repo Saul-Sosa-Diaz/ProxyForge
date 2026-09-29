@@ -47,11 +47,16 @@ for _canonical, _aliases in _MTG_VARIANT_ALIASES.items():
 _ART_KEYWORDS = _LORCANA_ART_KEYWORDS
 
 # Generic trailing bracket; content is validated by _parse_art_content so
-# unknown brackets stay part of the card name.
+# unknown brackets stay part of the card name. Long enough for pinned MPC
+# Autofill identifiers (Google Drive ids, ~33 chars).
 _ART_MARKER = re.compile(
-    r"\s*\[\s*([^\[\]]{1,40})\s*\]\s*$",
+    r"\s*\[\s*([^\[\]]{1,160})\s*\]\s*$",
     re.IGNORECASE,
 )
+
+# Pinned MPC Autofill image: '[mpc:1k4w07AFcKua0ldRpmTgXx0pTsEGv4kxg]'. The
+# identifier is case-sensitive, so it is matched before any lowercasing.
+_MPC_ART = re.compile(r"^mpc\s*:\s*(?P<identifier>[A-Za-z0-9_-]{8,128})$", re.IGNORECASE)
 
 _SET_CODE = r"[a-z0-9]{2,5}"
 _COLLECTOR = r"(?:\d{1,4}[a-z\u2605]{0,2}|\u2605)"
@@ -91,11 +96,16 @@ def _parse_art_content(content: str) -> str | None:
         - MTG set + collector: 2x2:117, 2x2-117, 2x2 117, pltr 253s ...
         - MTG set (+collector) + variant combos: m21 borderless,
           borderless m21, 2x2:117 showcase, showcase 2x2 117 ...
+        - MTG pinned MPC Autofill image: mpc:<identifier> (identifier
+          case preserved)
 
     Returns the normalized art string (e.g. ``"m21"``, ``"2x2:117"``,
-    ``"borderless"``, ``"m21 borderless"``) or ``None`` when the content
-    is not a recognized art expression.
+    ``"borderless"``, ``"m21 borderless"``, ``"mpc:1k4w07AF..."``) or
+    ``None`` when the content is not a recognized art expression.
     """
+    mpc = _MPC_ART.match(content.strip())
+    if mpc:
+        return f"mpc:{mpc.group('identifier')}"
     text = content.strip().lower()
     if not text:
         return None
@@ -240,7 +250,8 @@ def parse_deck_file(file_path: str) -> tuple[str, list[DeckCard]]:
     number (``[2x2:117]``, ``[2x2-117]``, ``[pltr 253s]``), a variant
     (``[fullart]``, ``[borderless]``, ``[showcase]``, ``[extended]``,
     ``[retro]``, ``[promo]``, ``[base]``/``[best]``) or a set (+collector)
-    + variant combo (``[m21 borderless]``, ``[2x2:117 showcase]``).
+    + variant combo (``[m21 borderless]``, ``[2x2:117 showcase]``) or a
+    pinned MPC Autofill image (``[mpc:<identifier>]``).
     Both markers are stripped from the name and exposed as
     ``DeckCard.foil`` / ``DeckCard.art``; they may appear in either order.
 
