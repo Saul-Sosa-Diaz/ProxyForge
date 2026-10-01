@@ -306,6 +306,8 @@ class Exporter:
         front_path = self._fetch_single_image(card.name, card.art, images_dir, unique)
         if front_path is None:
             return ResolvedCard(card=card)
+        if card.front_only:
+            return ResolvedCard(card=card, front_path=front_path)
         if not card.back_name:
             back_path = self._fetch_automatic_back(card.name, card.art, images_dir, unique)
             return ResolvedCard(card=card, front_path=front_path, back_path=back_path)
@@ -335,7 +337,7 @@ class Exporter:
             back_art = self.strategy.pin_art(card.back_name, card.back_art)
             if back_art != card.back_art:
                 update["back_art"] = back_art
-        else:
+        elif not card.front_only:
             back = self.strategy.pin_back(card.name, art)
             if back is not None:
                 update["back_name"], update["back_art"] = back

@@ -49,7 +49,7 @@ alongside a print-ready PDF configured to exact physical card dimensions
 | 🔌 **Strategy Pattern** | Extensible architecture to support multiple TCGs |
 | 🃏 **Lorcana** | Queries the **LorcanaJSON** API on every run, and falls back to scraping `lorcana.gg`; `[art]` decklist markers select the card art (default: most premium available) |
 | ⚡ **Pokémon** | Scrapes [`pkmncards.com`](https://pkmncards.com) search to pick the right printing among many reprints |
-| 🔮 **Magic: The Gathering** | Queries the [Scryfall API](https://scryfall.com/docs/api) live on every run (exact + fuzzy name lookup, collector-number lookup, variant/base art search, high-res `png` imagery) with a search fallback and a final [Moxfield](https://moxfield.com) fallback; `[art]` decklist markers select set / variant / printing. Lines marked `[mpc:<id>]` (picked in the web art picker) use that [MPC Autofill](https://mpcfill.com) full-resolution community image instead |
+| 🔮 **Magic: The Gathering** | Uses the [MPC Autofill](https://mpcfill.com) full-resolution community scan of exactly the decklist printing (`(SET) number` → `Name [SET] {number}`) or the `[mpc:<id>]` image picked in the web UI; otherwise queries the [Scryfall API](https://scryfall.com/docs/api) live (exact + fuzzy name lookup, collector-number lookup, variant/base art search, high-res `png` imagery) with a search fallback and a final [Moxfield](https://moxfield.com) fallback |
 | 💾 **Local** | Resolves cards from your own image files on disk; the card name is the local file name |
 | ♻️ **De-duplication** | Each unique card is downloaded only once, regardless of `quantity` |
 | 📁 **Auto-organization** | Output subfolder named after the deck file |
@@ -80,6 +80,11 @@ and each side strips its own trailing `[art]` / `*F*` markers independently:
 Lines without `/` stay single-sided — except MTG double-faced cards
 (transform, modal DFC...), whose back face is downloaded automatically, so
 `2 Jennifer Walters` alone prints both faces without naming the back.
+A `-` back (`1 Delver of Secrets [mpc:...] / -`) prints the front only and
+skips that automatic back — useful for MPC images that already show both
+faces on one side. In the web UI, **📄 Solo anverso** (front/back tabs) and
+**🔁 Pasar a Front / Back** (on those cards in the single-sided tabs) move a
+card between both and update the decklist.
 
 > 💡 `|` still works as a legacy alias for `/`. A double slash (`//`,
 > e.g. MTG split cards like `Fire // Ice`) is never a separator.
@@ -356,35 +361,58 @@ a set (+collector) + variant combo (the `[art]` set always wins over a
 
 ## 🔮 MTG Lookup (Magic: The Gathering)
 
-The MTG strategy resolves cards live through the **Scryfall API**
-(`https://api.scryfall.com`) — nothing is cached on disk. **[MPC Autofill](https://mpcfill.com)**
-(community print-ready scans, often 1200 DPI) is used **only for decklist
-lines that carry an `[mpc:<identifier>]` marker**, normally chosen in the web
-art picker (🎨 Arte lists every MPC image of the card with its source, DPI
-and size, then the Scryfall printings):
+The MTG strategy prefers **[MPC Autofill](https://mpcfill.com)**
+community print-ready scans (often 1200 DPI) **of exactly the printing the
+decklist asks for**, and otherwise resolves cards live through the
+**Scryfall API** (`https://api.scryfall.com`) — nothing is cached on disk:
+
+1. `[mpc:<identifier>]` — that exact MPC image (chosen in the web art picker,
+   which lists every MPC image of the card with its source, DPI and size, or
+   pinned by a previous run).
+2. **Same printing on MPC** — when the line names a set, via the `(SET) number`
+   annotation or a `[set:number]` / `[set]` marker, MPC is searched for an
+   image of the same card named `Card Name [SET] {number}`. That is the naming
+   convention of sources such as PsilosX, WarpDandy or Polymath; notes like
+   `(Normal)` or the artist are ignored. Set **and** number must match (a
+   line without a number only needs the set). The highest-DPI match is used
+   and pinned as `[mpc:<identifier>]` in the saved decklist, so later runs
+   get the same image.
+3. Everything else — no set on the line, no exact match on MPC, or
+   `[scryfall:<art>]` (forces the official image even when MPC has that
+   printing) — goes to Scryfall.
 
 > ```text
-> 1 Demonic Tutor (SLD) 1856 [mpc:1tJPmfGBt0Ria_updjEwkfkQZtNMkUoXF]   <- MPC, that exact image
-> 1 Chaos Emerald (SLD) 7037 [sld:7031]                                <- Scryfall
-> 1 Ororo Borealis (SLD) 1746                                          <- Scryfall
+> 1 Arid Mesa (SPG) 109            <- MPC 'Arid Mesa [SPG] {109}' (1200 DPI), saved as [mpc:…]
+> 1 Forest (TMT) 314               <- Scryfall (MPC has TMT Forests, but not #314)
+> 1 Ororo Borealis (SLD) 1746      <- Scryfall
+> 1 Demonic Tutor [mpc:1tJPmf…]    <- MPC, that exact image
+> 1 Arid Mesa (SPG) 109 [scryfall:spg:109]   <- Scryfall, official image
 > ```
 >
-> The identifier is the image's Google Drive id, so the same image is
-> downloaded on every run (`POST /2/cards/`). An MPC image that was removed
-> falls back to Scryfall. The automatic back of an MPC double-faced front
-> comes from MPC too (`GET /2/DFCPairs/`, highest-DPI hit) and is written
-> into the saved decklist as `/ Back [mpc:<identifier>]`.
+> Tokens are a separate card type on MPC, so every name is searched both as
+> a card and as a token (one request). Token lines use Scryfall's token set
+> codes (`Eldrazi Spawn (tmh3)`, `Squirrel (tblb) 23`), which match MPC token
+> scans named `Eldrazi Spawn [TMH3]{38}` or `Squirrel [TBLB 23]`. Names are
+> compared ignoring punctuation and a trailing "token" word
+> (`Chatterfang Squirrel General`, `Bird token [old]`).
+>
+> In the author's 112-card Commander deck 41 lines had their exact printing
+> on MPC. An MPC image that was removed falls back to Scryfall. The
+> automatic back of an MPC double-faced front comes from MPC too
+> (`GET /2/DFCPairs/`, same printing when available, otherwise the highest
+> DPI) and is written into the saved decklist as `/ Back [mpc:<identifier>]`.
 >
 > mpcfill.com sits behind Cloudflare, which answers bursts (~10 calls in a
-> few seconds) with HTTP 429. The strategy fetches a deck's MPC images in
-> batches before downloading (`/2/cards/` 1000 at a time), spaces MPC calls
-> 1.5 s apart, waits for `Retry-After` on a 429 and never caches a failed
-> lookup. Each downloaded card is logged with its source and quality
-> (`Card 'X' -> MPC Autofill 'X' (1200 DPI · 3.8 MB · MrTeferi)` or
+> few seconds) with HTTP 429. Before downloading, the strategy looks the
+> whole deck up in batches (one `editorSearch` call per 100 names,
+> `/2/cards/` 1000 images at a time — ~40 s for a 100-card deck), spaces MPC
+> calls 1.5 s apart, waits for `Retry-After` on a 429 and never caches a
+> failed lookup. Each downloaded card is logged with its source and quality
+> (`Card 'X' -> MPC Autofill 'X [SET] {n}' (1200 DPI · 9.4 MB · PsilosX)` or
 > `-> Scryfall (png, ~300 DPI)`), and the web UI shows the print DPI of
 > every card (⚠️ below 600 DPI).
 
-Lines without an MPC marker follow the Scryfall chain:
+Lines that end up on Scryfall follow its chain:
 
 1. `GET /cards/<set>/<collector>` — exact printing when the decklist pins
    one (`Lightning Bolt (2x2) 117`) or the `[art]` marker does (`[2x2:117]`).

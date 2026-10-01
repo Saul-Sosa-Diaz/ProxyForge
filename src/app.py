@@ -455,6 +455,8 @@ def _render_card(
         st.warning(f"Reverso no encontrado: {card.back_name}. Se imprimirá solo el anverso.")
     elif card.back_name:
         st.caption(f"Reverso: {card.back_name}")
+    elif card.front_only:
+        st.caption("Solo anverso (`/ -`)")
 
     if item.front_path is not None and st.button(
         "🃏 Pasar a normales" if card.foil else "✨ Pasar a foil",
@@ -462,6 +464,21 @@ def _render_card(
         width="stretch",
     ):
         _set_foil([index], not card.foil)
+    if item.back_path is not None and st.button(
+        "📄 Solo anverso",
+        key=f"front-only-{index}",
+        width="stretch",
+        help="Quita el reverso y la pasa a las cartas de una cara (p. ej. si la imagen "
+        "de MPC ya junta las dos caras).",
+    ):
+        _drop_back(index)
+    elif card.front_only and item.front_path is not None and st.button(
+        "🔁 Pasar a Front / Back",
+        key=f"front-back-{index}",
+        width="stretch",
+        help="Vuelve a ponerle su reverso.",
+    ):
+        _restore_back(index, ctx, deck_name)
 
     strategy = _get_strategy(ctx)
     art_col, edit_col = st.columns(2)
@@ -490,6 +507,50 @@ def _set_foil(indices: list[int], foil: bool) -> None:
     target = "Foil" if foil else "Normales"
     names = resolved[indices[0]].card.name if len(indices) == 1 else f"{len(indices)} cartas"
     st.session_state.flash = f"{names} → {target}"
+    st.rerun()
+
+
+def _drop_back(index: int) -> None:
+    """Move a double-sided card to the single-sided PDFs (front only).
+
+    The removed back is remembered so :func:`_restore_back` puts the very
+    same face back.
+    """
+    item: ResolvedCard = st.session_state.resolved[index]
+    card = item.card
+    removed: dict[tuple[str, str | None], tuple] = st.session_state.setdefault("removed_backs", {})
+    removed[(card.name, card.art)] = (card.back_name, card.back_art, card.back_foil, item.back_path)
+    front_only = card.model_copy(
+        update={"back_name": None, "back_art": None, "back_foil": False, "front_only": True}
+    )
+    _replace_card(index, item.model_copy(update={"card": front_only, "back_path": None}))
+    st.session_state.flash = f"{card.name} → solo anverso"
+    st.rerun()
+
+
+def _restore_back(index: int, ctx: _Context, deck_name: str) -> None:
+    """Move a front-only card back to the front/back PDFs with its back face.
+
+    Reuses the back removed in this session; otherwise the card is resolved
+    again so the strategy adds its back (e.g. MTG double-faced cards).
+    """
+    item: ResolvedCard = st.session_state.resolved[index]
+    card = item.card.model_copy(update={"front_only": False})
+    removed = st.session_state.get("removed_backs", {}).pop((card.name, card.art), None)
+    if removed is not None and removed[3].exists():
+        back_name, back_art, back_foil, back_path = removed
+        card = card.model_copy(
+            update={"back_name": back_name, "back_art": back_art, "back_foil": back_foil}
+        )
+        updated = item.model_copy(update={"card": card, "back_path": back_path})
+    else:
+        with st.spinner(f"Buscando el reverso de {card.name}…"):
+            updated = _get_exporter(ctx).resolve_images(deck_name, [card])[0]
+    if updated.front_path is None or updated.back_path is None:
+        st.session_state.flash_warning = f"No se encontró un reverso para {card.name}; sigue con solo anverso."
+        st.rerun()
+    _replace_card(index, updated)
+    st.session_state.flash = f"{card.name} → Front / Back"
     st.rerun()
 
 
@@ -840,6 +901,8 @@ def main() -> None:
 
     if flash := st.session_state.pop("flash", None):
         st.toast(flash, icon="✅")
+    if flash_warning := st.session_state.pop("flash_warning", None):
+        st.toast(flash_warning, icon="⚠️")
 
     ctx, dpi = _render_sidebar()
     _render_deck_input(ctx)

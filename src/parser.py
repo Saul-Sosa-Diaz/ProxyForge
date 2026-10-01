@@ -60,6 +60,9 @@ _MPC_ART = re.compile(r"^mpc\s*:\s*(?P<identifier>[A-Za-z0-9_-]{8,128})$", re.IG
 # Forced Scryfall printing (MTG web art picker): '[scryfall:sld:2195]'.
 _SCRYFALL_ART = re.compile(r"^scryfall\s*:\s*(?P<art>.+)$", re.IGNORECASE)
 
+# Back face written as '/ -': print the front only ('1 Delver of Secrets / -').
+FRONT_ONLY_BACK = "-"
+
 _SET_CODE = r"[a-z0-9]{2,5}"
 _COLLECTOR = r"(?:\d{1,4}[a-z\u2605]{0,2}|\u2605)"
 _SET_COLLECTOR_JOINED = re.compile(
@@ -276,6 +279,9 @@ def parse_deck_file(file_path: str) -> tuple[str, list[DeckCard]]:
     (``|`` still works as a legacy alias for ``/``. ``//`` inside a card
     name, e.g. MTG split cards like ``Fire // Ice``, is never a separator.)
 
+    A ``-`` back (``1 Delver of Secrets / -``) prints the front only, with
+    no automatic back face (``DeckCard.front_only``).
+
     Each side strips its own trailing ``[art]`` / ``*F*`` markers
     independently (``back_name`` / ``back_art`` / ``back_foil``). PDF
     grouping (regular vs foil) always follows the front-face foil flag so
@@ -298,7 +304,9 @@ def format_deck(cards: Iterable[DeckCard]) -> str:
 def format_deck_line(card: DeckCard) -> str:
     """One decklist line for ``card`` (see :func:`format_deck`)."""
     line = f"{card.quantity} {_format_face(card.name, card.art, card.foil)}"
-    if card.back_name:
+    if card.front_only:
+        line += f" / {FRONT_ONLY_BACK}"
+    elif card.back_name:
         line += f" / {_format_face(card.back_name, card.back_art, card.back_foil)}"
     return line
 
@@ -344,7 +352,8 @@ def parse_deck_lines(lines: Iterable[str]) -> list[DeckCard]:
         back_name: str | None = None
         back_art: str | None = None
         back_foil = False
-        if back_part is not None and back_part.strip():
+        front_only = back_part is not None and back_part.strip() == FRONT_ONLY_BACK
+        if back_part is not None and back_part.strip() and not front_only:
             clean_back, clean_back_foil, clean_back_art = _strip_trailing_markers(
                 back_part.strip()
             )
@@ -364,6 +373,7 @@ def parse_deck_lines(lines: Iterable[str]) -> list[DeckCard]:
                 back_name=back_name,
                 back_art=back_art,
                 back_foil=back_foil,
+                front_only=front_only,
             )
         )
     return cards

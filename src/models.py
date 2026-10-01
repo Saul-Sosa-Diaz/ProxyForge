@@ -50,6 +50,14 @@ class DeckCard(BaseModel):
             "follows the front-face 'foil' flag so front/back pages stay aligned."
         ),
     )
+    front_only: bool = Field(
+        default=False,
+        description=(
+            "Print the front face only, without any back (written as '/ -' in the "
+            "decklist: '1 Delver of Secrets / -'). Skips the automatic back face "
+            "a strategy would add (e.g. MTG double-faced cards)."
+        ),
+    )
 
 
 class ArtOption(BaseModel):

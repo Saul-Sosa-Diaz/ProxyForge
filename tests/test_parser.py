@@ -36,11 +36,20 @@ def test_format_deck_round_trips():
         "1 Sol Ring (TLE) 316 [sld:1512★]\n"
         "3 Fire // Ice\n"
         "1 Delver of Secrets / Insectile Aberration *F*\n"
+        "1 Delver of Secrets [mpc:1k4w07AFcKua] *F* / -\n"
     )
     cards = parse_deck_text(text)
 
     assert format_deck(cards) == text
     assert parse_deck_text(format_deck(cards)) == cards
+
+
+def test_dash_back_means_front_only():
+    card = parse_deck_text("1 Delver of Secrets [mpc:1k4w07AFcKua] / -")[0]
+
+    assert card.front_only
+    assert (card.name, card.art, card.back_name) == ("Delver of Secrets", "mpc:1k4w07AFcKua", None)
+    assert not parse_deck_text("1 Delver of Secrets")[0].front_only
 
 
 def test_mpc_marker_keeps_identifier_case():

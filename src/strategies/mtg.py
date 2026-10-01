@@ -86,10 +86,15 @@ MTG_VARIANT_CHOICES = ("fullart", "borderless", "showcase", "extended", "retro",
 MTG_ART_MODES = ("best", "base")
 # '[mpc:<identifier>]' pins one MPC Autofill image (case-sensitive id).
 MPC_ART_PREFIX = "mpc:"
-# Legacy '[scryfall:<art>]' marker (Scryfall is now the default): same as '[<art>]'.
+# '[scryfall:<art>]' forces the official Scryfall image of that printing,
+# skipping the same printing on MPC Autofill.
 SCRYFALL_ART_PREFIX = "scryfall:"
 # Set code written next to a card name: '[TMT]', '(TMT)', or a 'tmt:192' marker.
 _SET_CODE_IN_TEXT = re.compile(r"(?:[\[(]|\b)([A-Za-z0-9]{2,5})(?:[\])]|:)")
+# Printing written in MPC image names: 'Arid Mesa [SPG] {109} (notes)'.
+_MPC_NAME_SET = re.compile(r"\[([A-Za-z0-9]{2,6})(?:\s+([0-9]+[A-Za-z★]?))?\]")
+_MPC_NAME_NUMBER = re.compile(r"\{([^{}]+)\}")
+_MPC_NAME_NOTES = re.compile(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}")
 # MPC images that stand in for a card rather than show it.
 _MPC_STAND_IN = re.compile(r"\b(checklist|placeholder)\b", re.IGNORECASE)
 
@@ -115,6 +120,8 @@ class MTGStrategy(TCGStrategy):
     MPC_CARDS_BATCH_SIZE = 1000
     # Names per ``POST /2/editorSearch/`` call (a 112-card deck fits in one).
     MPC_SEARCH_BATCH_SIZE = 100
+    # MPC keeps tokens apart from cards; every name is searched as both.
+    MPC_CARD_TYPES = ("CARD", "TOKEN")
     # mpcfill.com (Cloudflare) answers ~10 calls in a few seconds with HTTP
     # 429 + Retry-After: 10; one call every 1.5 s stays clear of it.
     MPC_DEFAULT_MIN_REQUEST_INTERVAL = 1.5
@@ -176,8 +183,8 @@ class MTGStrategy(TCGStrategy):
         output_path: str,
         art: str | None = None,
     ) -> bool:
-        # 1. MPC Autofill only for an explicit '[mpc:<identifier>]' marker
-        # (chosen in the web art picker): always that exact image.
+        # 1. Explicit '[mpc:<identifier>]' marker (web art picker or a
+        # previous run): always that exact image.
         identifier = _mpc_identifier(art)
         if identifier is not None:
             card = self._mpc_card(identifier)
@@ -191,8 +198,17 @@ class MTGStrategy(TCGStrategy):
                 card_name,
             )
             art = None
-        # 2. Everything else: Scryfall (then Moxfield).
-        art = _effective_art(card_name, _scryfall_art(art))
+        # 2. The same printing (set + collector number) on MPC Autofill,
+        # unless '[scryfall:<art>]' asks for the official Scryfall image.
+        forced = _is_forced_scryfall(art)
+        art = _scryfall_art(art)
+        same = None if forced else self._mpc_same_printing(card_name, art)
+        same_url = self._mpc_image_url(same) if same is not None else None
+        if same_url:
+            _log_mpc_choice(card_name, same)
+            return self._download_image(same_url, output_path)
+        # 3. Everything else: Scryfall (then Moxfield).
+        art = _effective_art(card_name, art)
         image_url = self._resolve_image_url(card_name, art)
         if not image_url:
             return False
@@ -242,46 +258,72 @@ class MTGStrategy(TCGStrategy):
         )
         return self._download_image(back_url, output_path)
 
+    def pin_art(self, card_name: str, art: str | None = None) -> str | None:
+        """Pin the MPC image of the same printing as ``mpc:<identifier>``.
+
+        Lines whose set (and collector number) has an MPC image named
+        ``Name [SET] {number}`` get that image pinned, so the saved decklist
+        reproduces it; every other line keeps its marker (Scryfall).
+        """
+        if _mpc_identifier(art) is not None or _is_forced_scryfall(art):
+            return art
+        card = self._mpc_same_printing(card_name, _scryfall_art(art))
+        if card is None:
+            return art
+        return f"{MPC_ART_PREFIX}{card['identifier']}"
+
     def pin_back(self, card_name: str, art: str | None = None) -> tuple[str, str | None] | None:
         """Pin the MPC ``DFCPairs`` back of an MPC front as ``/ Back [mpc:<id>]``.
 
-        The back image is the highest-DPI MPC hit for the back name, written
-        into the saved decklist so later runs reuse it. Scryfall fronts keep
-        their automatic Scryfall back.
+        The back is the same printing as the front when MPC has it (back
+        name with the front's ``[SET] {number}``), otherwise the highest-DPI
+        MPC image of the back, written into the saved decklist so later runs
+        reuse it. Scryfall fronts keep their automatic Scryfall back.
         """
         if _mpc_identifier(art) is None:
             return None
-        clean_name, _, _ = _parse_card_reference(card_name)
+        clean_name, set_code, collector = _parse_card_reference(card_name)
         back_name = self._mpc_back_name(clean_name)
         if not back_name:
             return None
-        card = self._mpc_best_card(back_name)
+        card = self._mpc_printing_match(back_name, set_code, collector) if set_code else None
+        card = card or self._mpc_best_card(back_name)
         if card is None:
             return None
         return back_name, f"{MPC_ART_PREFIX}{card['identifier']}"
 
     def prefetch(self, cards: list[DeckCard]) -> None:
-        """Batch the MPC Autofill lookups of a deck's ``[mpc:<id>]`` entries.
+        """Batch the MPC Autofill lookups of a whole deck.
 
-        Only entries with an MPC marker touch MPC: their card documents are
-        fetched ``MPC_CARDS_BATCH_SIZE`` at a time, and the back names of
-        MPC fronts without an explicit back are searched in one batched
-        ``editorSearch`` call, so the rate limit is never hit by a deck.
+        Looks up in one go the ``[mpc:<id>]`` images, the names of lines
+        that name a set (candidates for the same printing on MPC) and the
+        double-faced backs of both: one ``editorSearch`` call per
+        ``MPC_SEARCH_BATCH_SIZE`` names and one ``/2/cards/`` call per
+        ``MPC_CARDS_BATCH_SIZE`` images, so a deck never trips the rate
+        limit (~40 s of paced requests for a 100-card deck).
         """
         identifiers: list[str] = []
-        back_names: list[str] = []
+        names: list[str] = []
         for card in cards:
-            for art in (card.art, card.back_art if card.back_name else None):
+            faces = [(card.name, card.art)]
+            if card.back_name:
+                faces.append((card.back_name, card.back_art))
+            for name, art in faces:
                 identifier = _mpc_identifier(art)
                 if identifier is not None:
                     identifiers.append(identifier)
-            if not card.back_name and _mpc_identifier(card.art) is not None:
+                elif not _is_forced_scryfall(art) and _printing_target(name, art)[1]:
+                    names.append(_parse_card_reference(name)[0])
+            if not card.back_name and not card.front_only and (
+                _mpc_identifier(card.art) is not None
+                or (not _is_forced_scryfall(card.art) and _printing_target(card.name, card.art)[1])
+            ):
                 back_name = self._mpc_back_name(_parse_card_reference(card.name)[0])
                 if back_name:
-                    back_names.append(back_name)
-        if back_names:
-            self._mpc_search_many(back_names)
-            for name in back_names:
+                    names.append(back_name)
+        if names:
+            self._mpc_search_many(names)
+            for name in names:
                 identifiers.extend(self._mpc_search_cache.get(_normalize(name), []))
         if identifiers:
             self._mpc_cards(identifiers)
@@ -328,6 +370,46 @@ class MTGStrategy(TCGStrategy):
     # ------------------------------------------------------------------
     # MPC Autofill (explicit '[mpc:<identifier>]' arts and the art picker)
     # ------------------------------------------------------------------
+    def _mpc_same_printing(self, card_name: str, art: str | None) -> dict[str, Any] | None:
+        """MPC image of exactly the decklist printing, or ``None``.
+
+        The printing comes from the ``[set:collector]`` art marker or the
+        ``(SET) number`` annotation (see :func:`_printing_target`); lines
+        without a set never match.
+        """
+        clean_name, set_code, collector = _printing_target(card_name, art)
+        if not set_code:
+            return None
+        return self._mpc_printing_match(clean_name, set_code, collector)
+
+    def _mpc_printing_match(
+        self, clean_name: str, set_code: str, collector: str | None
+    ) -> dict[str, Any] | None:
+        """Highest-DPI MPC image named ``<clean_name> [SET] {collector}``.
+
+        Community sources such as PsilosX or WarpDandy name their scans
+        ``Arid Mesa [SPG] {109}`` (tokens: ``Eldrazi Spawn [TMH3]{38}``,
+        ``Squirrel [TBLB 23]``); extra notes (``(Normal)``, ``[hd]``,
+        artist...) are ignored. With a ``collector`` both set and number
+        must match (an image without a number does not); without one, the
+        set is enough.
+        """
+        want_name = _name_key(clean_name)
+        want_set = set_code.lower()
+        want_number = _collector_key(collector) if collector else None
+        for card in self._mpc_ranked_cards(clean_name):
+            name, printings = _mpc_printings(str(card.get("name") or ""))
+            if name != want_name:
+                continue
+            for card_set, number in printings:
+                if card_set != want_set:
+                    continue
+                if want_number is None or (
+                    number is not None and _collector_key(number) == want_number
+                ):
+                    return card
+        return None
+
     def _mpc_best_card(self, clean_name: str) -> dict[str, Any] | None:
         """Highest-DPI MPC Autofill hit for a card name (``None`` if none).
 
@@ -425,7 +507,12 @@ class MTGStrategy(TCGStrategy):
                     "excludesTags": [],
                 },
             },
-            "queries": [{"query": query, "cardType": "CARD"} for query in queries],
+            # Tokens are a separate MPC card type: ask for both in one call.
+            "queries": [
+                {"query": query, "cardType": card_type}
+                for query in queries
+                for card_type in self.MPC_CARD_TYPES
+            ],
         }
         logger.debug("MPC Autofill search for %d name(s)", len(queries))
         data = self._mpc_json(self._mpc_post(self.MPC_EDITOR_SEARCH_ENDPOINT, payload))
@@ -434,10 +521,13 @@ class MTGStrategy(TCGStrategy):
             return None
         hits: dict[str, list[str]] = {}
         for raw_key, per_type in results.items():
-            if isinstance(per_type, dict) and isinstance(per_type.get("CARD"), list):
-                hits[_normalize(str(raw_key))] = [
-                    h for h in per_type["CARD"] if isinstance(h, str) and h
-                ]
+            if not isinstance(per_type, dict):
+                continue
+            found = hits.setdefault(_normalize(str(raw_key)), [])
+            for card_type in self.MPC_CARD_TYPES:
+                ids = per_type.get(card_type)
+                if isinstance(ids, list):
+                    found.extend(h for h in ids if isinstance(h, str) and h and h not in found)
         return hits
 
     def _mpc_source_settings(self) -> list[list[Any]] | None:
@@ -1076,8 +1166,13 @@ def _mpc_identifier(art: str | None) -> str | None:
     return None
 
 
+def _is_forced_scryfall(art: str | None) -> bool:
+    """True for ``scryfall:<art>``: the official image, never MPC's same printing."""
+    return bool(art) and art[: len(SCRYFALL_ART_PREFIX)].lower() == SCRYFALL_ART_PREFIX
+
+
 def _scryfall_art(art: str | None) -> str | None:
-    """Scryfall ``[art]`` marker, dropping a legacy ``scryfall:`` prefix."""
+    """Scryfall ``[art]`` marker without its ``scryfall:`` prefix."""
     if art and art[: len(SCRYFALL_ART_PREFIX)].lower() == SCRYFALL_ART_PREFIX:
         return art[len(SCRYFALL_ART_PREFIX) :].strip() or None
     return art
@@ -1275,6 +1370,54 @@ def _with_set_keywords(option: ArtOption, set_names: dict[str, str]) -> ArtOptio
     if not words:
         return option
     return option.model_copy(update={"keywords": " ".join([option.keywords, *words]).strip()})
+
+
+def _printing_target(card_name: str, art: str | None) -> tuple[str, str | None, str | None]:
+    """``(clean name, set, collector)`` a decklist line asks for.
+
+    A ``[set:collector]`` / ``[set]`` art marker wins over the
+    ``(SET) number`` annotation of the name (``[m21]`` drops the
+    annotation's collector number, which belongs to another set).
+    """
+    clean_name, set_code, collector = _parse_card_reference(card_name)
+    art_set, art_collector, _, _ = _parse_mtg_art(art) if art else (None, None, None, None)
+    if art_set:
+        set_code, collector = art_set, art_collector
+    return clean_name, set_code, collector
+
+
+def _mpc_printings(name: str) -> tuple[str, list[tuple[str, str | None]]]:
+    """``(normalized card name, [(set, number), ...])`` from an MPC image name.
+
+    ``Basking Broodscale (Normal) [MH3] {145}`` -> ``("basking broodscale",
+    [("mh3", "145")])``; ``Squirrel [TBLB 23]`` -> ``("squirrel",
+    [("tblb", "23")])``. Every ``[...]`` is a candidate (``[old]`` or
+    ``[hd]`` notes never match a real set code). A trailing "token" word is
+    dropped from the name (``Bird token [old]`` -> ``"bird"``).
+    """
+    braces = _MPC_NAME_NUMBER.search(name)
+    loose_number = braces.group(1).strip().lower() if braces else None
+    printings = [
+        (match.group(1).lower(), (match.group(2) or loose_number or "").lower() or None)
+        for match in _MPC_NAME_SET.finditer(name)
+    ]
+    clean = _name_key(_MPC_NAME_NOTES.sub(" ", name))
+    clean = re.sub(r" token$", "", clean)
+    return clean, printings
+
+
+def _name_key(name: str) -> str:
+    """Name compared with MPC image names, ignoring punctuation and case.
+
+    ``Chatterfang, Squirrel General`` == ``Chatterfang Squirrel General``;
+    ``Sevinne's Reclamation`` == ``Sevinne_s Reclamation``.
+    """
+    return " ".join(re.findall(r"[^\W_]+", name.lower()))
+
+
+def _collector_key(collector: str) -> str:
+    """Comparable collector number (``"0109"`` == ``"109"``)."""
+    return collector.strip().lower().lstrip("0") or "0"
 
 
 def _initials(text: str) -> str:

@@ -239,6 +239,35 @@ def test_move_card_between_regular_and_foil(tmp_path):
     assert [r.card.foil for r in at.session_state.resolved] == [False, False]
 
 
+def _move_sides(at: AppTest, label: str, tab: str) -> AppTest:
+    _button(_open_tab(at, tab), label).click()
+    at.session_state["preview-tab"] = tab  # AppTest would resend the old tab
+    return at.run()
+
+
+def test_move_card_between_front_back_and_single_sided(tmp_path):
+    at = _resolve_local_deck(tmp_path, "1 Pikachu / Charizard\n2 Bolt", strategy=FakeStrategy(backs={"Bolt"}))
+    written = tmp_path / "local" / "preview" / "preview.txt"
+    assert _tab_labels(at) == ["🔁 Front / Back"]
+    at = _open_tab(at, "🔁 Front / Back")
+
+    at = _move_sides(at, "Solo anverso", "🔁 Front / Back")  # Pikachu / Charizard
+
+    assert not at.exception
+    assert _tab_labels(at) == ["🃏 Normales", "🔁 Front / Back"]
+    assert written.read_text(encoding="utf-8") == "1 Pikachu / -\n2 Bolt\n"
+    at = _move_sides(at, "Solo anverso", "🔁 Front / Back")  # automatic back of Bolt
+    assert _tab_labels(at) == ["🃏 Normales"]
+    assert written.read_text(encoding="utf-8") == "1 Pikachu / -\n2 Bolt / -\n"
+
+    at = _move_sides(at, "Pasar a Front / Back", "🃏 Normales")  # restores Charizard
+    at = _move_sides(at, "Pasar a Front / Back", "🃏 Normales")  # Bolt: asks the strategy again
+    assert not at.exception
+    assert _tab_labels(at) == ["🔁 Front / Back"]
+    assert all(r.back_path is not None for r in at.session_state.resolved)
+    assert written.read_text(encoding="utf-8") == "1 Pikachu / Charizard\n2 Bolt\n"
+
+
 def test_move_whole_tab_to_foil(tmp_path):
     at = _resolve_local_deck(tmp_path, "2 Pikachu\n1 Charizard")
 

@@ -73,13 +73,65 @@ def _mpc_calls(strategy):
     return [call for call in strategy._session.calls if "mpcfill.com" in call]
 
 
-def test_card_without_mpc_marker_uses_scryfall(tmp_path):
+def test_card_without_same_printing_on_mpc_uses_scryfall(tmp_path):
     strategy = _strategy({**_mpc_routes(), "/cards/named?exact=Lightning Bolt": _json("mtg_dark_leo.json")})
 
+    # MPC only has 'Lightning Bolt (Full Art)' (no [M21] printing).
     assert strategy.fetch_card_image("Lightning Bolt", str(tmp_path / "l.png"), art="m21")
 
     assert "https://img.test/dark-leo.png" in strategy._session.calls
-    assert _mpc_calls(strategy) == []  # MPC is never asked
+    assert "https://img.test/mpc-full.png" not in strategy._session.calls
+
+
+def test_line_without_a_set_never_asks_mpc(tmp_path):
+    strategy = _strategy({**_mpc_routes(), "/cards/named?exact=Lightning Bolt": _json("mtg_dark_leo.json")})
+
+    assert strategy.fetch_card_image("Lightning Bolt", str(tmp_path / "l.png"))
+
+    assert "https://img.test/dark-leo.png" in strategy._session.calls
+    assert _mpc_calls(strategy) == []
+
+
+def _printing_routes():
+    def doc(identifier, name, dpi):
+        return {"identifier": identifier, "name": name, "dpi": dpi,
+                "downloadLink": f"https://img.test/{identifier}.png"}
+
+    routes = _mpc_routes()
+    routes["editorSearch"] = FakeResponse(json_data={"results": {"dark leo & shredder": {"CARD": [
+        "tmt-220-low", "tmt-220", "tmt-221", "tmc-220", "tmt-plain", "other-card",
+    ]}}})
+    routes["2/cards"] = FakeResponse(json_data={"results": {
+        "tmt-220-low": doc("tmt-220-low", "Dark Leo & Shredder (Normal) [TMT] {220}", 800),
+        "tmt-220": doc("tmt-220", "Dark Leo & Shredder [TMT] {0220} (Artist)", 1200),
+        "tmt-221": doc("tmt-221", "Dark Leo & Shredder [TMT] {221}", 1500),
+        "tmc-220": doc("tmc-220", "Dark Leo & Shredder [TMC] {220}", 1500),
+        "tmt-plain": doc("tmt-plain", "Dark Leo & Shredder [TMT]", 1500),
+        "other-card": doc("other-card", "Dark Leo & Shredder Fan Art [TMT] {220}", 1500),
+    }})
+    routes["/cards/tmt/999"] = _json("mtg_dark_leo.json")
+    return routes
+
+
+def test_same_printing_on_mpc_is_used_and_pinned(tmp_path):
+    strategy = _strategy(_printing_routes())
+
+    assert strategy.pin_art("Dark Leo & Shredder (TMT) 220") == "mpc:tmt-220"  # highest DPI
+    assert strategy.fetch_card_image("Dark Leo & Shredder (TMT) 220", str(tmp_path / "d.png"))
+    assert "https://img.test/tmt-220.png" in strategy._session.calls
+    assert not any("scryfall" in call for call in strategy._session.calls)
+    # An art marker wins over the name annotation.
+    assert strategy.pin_art("Dark Leo & Shredder (TMC) 1", "tmt:221") == "mpc:tmt-221"
+
+
+def test_same_printing_needs_the_collector_number(tmp_path):
+    strategy = _strategy(_printing_routes())
+
+    assert strategy.pin_art("Dark Leo & Shredder (TMT) 999") is None
+    assert strategy.fetch_card_image("Dark Leo & Shredder (TMT) 999", str(tmp_path / "d.png"))
+    assert "https://img.test/dark-leo.png" in strategy._session.calls  # Scryfall
+    # A set-only line accepts any image of that set.
+    assert strategy.pin_art("Dark Leo & Shredder", "tmt") in {"mpc:tmt-221", "mpc:tmt-plain"}
 
 
 def test_mpc_marker_downloads_that_image(tmp_path):
@@ -114,13 +166,13 @@ def test_mpc_front_gets_its_mpc_back(tmp_path):
     assert strategy.pin_back("Delver of Secrets", "m21") is None
 
 
-def test_pin_art_never_switches_a_card_to_mpc(tmp_path):
+def test_pin_art_keeps_lines_without_a_same_printing(tmp_path):
     strategy = _strategy(_mpc_routes())
 
     assert strategy.pin_art("Lightning Bolt") is None
-    assert strategy.pin_art("Lightning Bolt", "m21") == "m21"
     assert strategy.pin_art("Lightning Bolt", "mpc:mpc-id-1") == "mpc:mpc-id-1"
-    assert _mpc_calls(strategy) == []
+    assert _mpc_calls(strategy) == []  # no set: MPC is not asked
+    assert strategy.pin_art("Lightning Bolt", "m21") == "m21"  # no [M21] image on MPC
 
 
 def test_saved_decklist_keeps_mpc_choices(tmp_path):
@@ -145,13 +197,14 @@ def test_saved_decklist_keeps_mpc_choices(tmp_path):
     Exporter(strategy, str(tmp_path / "second"), target_dpi=50).export_deck("deck", parse_deck_text(saved))
 
     calls = strategy._session.calls
-    assert not any("editorSearch" in call for call in calls)
+    searches = [call for call in calls if "editorSearch" in call]
+    assert not any("Lightning Bolt" in call or "Delver" in call for call in searches)
     for url in ("mpc-full.png", "mpc-front-full.png", "mpc-back-full.png", "dark-leo.png"):
         assert f"https://img.test/{url}" in calls
     assert (tmp_path / "second" / "deck" / "deck.txt").read_text(encoding="utf-8") == saved
 
 
-def test_prefetch_only_touches_mpc_for_mpc_entries(tmp_path):
+def test_prefetch_batches_the_whole_deck(tmp_path):
     routes = {**_mpc_routes(), "/cards/tmt/220": _json("mtg_dark_leo.json")}
     strategy = _strategy(routes)
     cards = parse_deck_text(
@@ -162,16 +215,17 @@ def test_prefetch_only_touches_mpc_for_mpc_entries(tmp_path):
 
     calls = _mpc_calls(strategy)
     searches = [call for call in calls if "editorSearch" in call]
-    assert len(searches) == 1 and "Insectile Aberration" in searches[0]  # only the MPC back
-    assert "Dark Leo" not in searches[0]
+    assert len(searches) == 1  # one search for the whole deck
+    assert "Insectile Aberration" in searches[0] and "Dark Leo" in searches[0]
+    assert "Lightning Bolt" not in searches[0]  # pinned: fetched by identifier
     assert sum("mpcfill.com/2/cards" in call for call in calls) == 1
 
 
-def test_deck_without_mpc_markers_never_calls_mpc(tmp_path):
-    strategy = _strategy({**_mpc_routes(), "/cards/tmt/220": _json("mtg_dark_leo.json")})
+def test_deck_without_sets_never_calls_mpc(tmp_path):
+    strategy = _strategy({**_mpc_routes(), "/cards/named?exact=Dark Leo": _json("mtg_dark_leo.json")})
 
     Exporter(strategy, str(tmp_path), target_dpi=50).resolve_images(
-        "deck", parse_deck_text("1 Dark Leo & Shredder (TMT) 220\n")
+        "deck", parse_deck_text("1 Dark Leo & Shredder\n")
     )
 
     assert _mpc_calls(strategy) == []
@@ -255,7 +309,7 @@ def test_mpc_stand_ins_are_never_the_pinned_back(tmp_path):
     )
 
 
-def test_legacy_scryfall_marker_still_works(tmp_path):
+def test_scryfall_prefix_forces_the_official_image(tmp_path):
     strategy = _strategy({**_mpc_routes(), "/cards/c21/263": _json("mtg_dark_leo.json")})
 
     assert strategy.fetch_card_image("Dark Leo & Shredder", str(tmp_path / "d.png"), art="scryfall:c21:263")
@@ -389,3 +443,34 @@ def test_art_options_can_be_found_by_set_name_and_initials(tmp_path):
 
     assert "Teenage Mutant Ninja Turtles" in option.keywords
     assert "tmnt" in option.keywords.split()
+
+
+def test_tokens_are_searched_and_matched_by_printing(tmp_path):
+    def doc(identifier, name, dpi=800):
+        return {"identifier": identifier, "name": name, "dpi": dpi, "cardType": "TOKEN",
+                "downloadLink": f"https://img.test/{identifier}.png",
+                "smallThumbnailUrl": f"https://img.test/{identifier}-thumb.jpg"}
+
+    routes = _mpc_routes()
+    routes["editorSearch"] = FakeResponse(json_data={"results": {
+        # MPC answers per name and card type; tokens live under "TOKEN".
+        "squirrel": {"CARD": ["card-squirrel-general"], "TOKEN": ["tok-tblb", "tok-tunf", "tok-old"]},
+        "eldrazi spawn": {"TOKEN": ["spawn-tmh3"]},
+    }})
+    routes["2/cards"] = FakeResponse(json_data={"results": {
+        "card-squirrel-general": doc("card-squirrel-general", "Chatterfang, Squirrel General", 1200),
+        "tok-tblb": doc("tok-tblb", "Squirrel [TBLB 23]"),
+        "tok-tunf": doc("tok-tunf", "Squirrel token [TUNF]{8} [hd]"),
+        "tok-old": doc("tok-old", "Squirrel token [old] [hd]", 1200),
+        "spawn-tmh3": doc("spawn-tmh3", "Eldrazi Spawn (Aleksi Briclot) [TMH3] {2}"),
+    }})
+    strategy = _strategy(routes)
+
+    assert strategy.pin_art("Squirrel (tunf)") == "mpc:tok-tunf"
+    assert strategy.pin_art("Squirrel (tblb) 23") == "mpc:tok-tblb"
+    assert strategy.pin_art("Eldrazi Spawn (tmh3)") == "mpc:spawn-tmh3"
+    search = next(call for call in strategy._session.calls if "editorSearch" in call)
+    assert '"cardType": "TOKEN"' in search and '"cardType": "CARD"' in search
+    # The token picker lists the tokens (and the fuzzy card hit) of that name.
+    values = [o.value for o in strategy.list_art_options("Squirrel (tunf)")]
+    assert {"mpc:tok-tblb", "mpc:tok-tunf", "mpc:tok-old"} <= set(values)

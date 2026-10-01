@@ -71,6 +71,19 @@ def test_automatic_back_from_strategy(tmp_path):
     assert (tmp_path / "deck" / "back_deck.pdf").exists()
 
 
+def test_front_only_card_skips_its_automatic_back(tmp_path):
+    exporter = Exporter(FakeStrategy(backs={"Delver"}), str(tmp_path), target_dpi=LOW_DPI)
+    cards = [DeckCard(quantity=1, name="Delver", front_only=True)]
+
+    resolved = exporter.resolve_images("deck", cards)
+    exporter.render_pdfs("deck", resolved)
+
+    assert resolved[0].front_path is not None and resolved[0].back_path is None
+    assert resolved[0].card.front_only
+    assert (tmp_path / "deck" / "deck.pdf").exists()
+    assert not (tmp_path / "deck" / "front_deck.pdf").exists()
+
+
 def test_failed_cards_are_skipped(tmp_path):
     pdf = _export(FakeStrategy(known={"Bolt"}), tmp_path, [
         DeckCard(quantity=1, name="Bolt"),
