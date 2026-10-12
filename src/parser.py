@@ -59,6 +59,15 @@ _ART_MARKER = re.compile(
 _MPC_ART = re.compile(r"^mpc\s*:\s*(?P<identifier>[A-Za-z0-9_-]{8,128})$", re.IGNORECASE)
 # Forced Scryfall printing (MTG web art picker): '[scryfall:sld:2195]'.
 _SCRYFALL_ART = re.compile(r"^scryfall\s*:\s*(?P<art>.+)$", re.IGNORECASE)
+# Own image from the local images directory, for any game:
+# '[file:Lightning Bolt-1a2b3c4d5e.png]'. The file name keeps its case and
+# cannot hold '/', '\' or '|' (front/back separators) nor brackets.
+FILE_ART_PREFIX = "file:"
+_FILE_ART = re.compile(r"^file\s*:\s*(?P<file>[^\[\]/\\|]*[^\[\]/\\|\s])$", re.IGNORECASE)
+
+# Section line choosing the game of the cards below it, so one deck can mix
+# strategies: '[mtg]', '[lorcana]', '[local]', '[pokemon]'.
+_SECTION = re.compile(r"^\[\s*(?P<tcg>[a-z][a-z0-9_-]*)\s*\]$", re.IGNORECASE)
 
 # Back face written as '/ -': print the front only ('1 Delver of Secrets / -').
 FRONT_ONLY_BACK = "-"
@@ -105,6 +114,8 @@ def _parse_art_content(content: str) -> str | None:
           case preserved)
         - MTG forced Scryfall art: scryfall:<any MTG form above>
           (e.g. scryfall:sld:2195), skips MPC Autofill
+        - Own image, any game: file:<file name in the local images
+          directory> (file name case preserved)
 
     Returns the normalized art string (e.g. ``"m21"``, ``"2x2:117"``,
     ``"borderless"``, ``"m21 borderless"``, ``"mpc:1k4w07AF..."``) or
@@ -113,10 +124,13 @@ def _parse_art_content(content: str) -> str | None:
     mpc = _MPC_ART.match(content.strip())
     if mpc:
         return f"mpc:{mpc.group('identifier')}"
+    own_file = _FILE_ART.match(content.strip())
+    if own_file:
+        return f"{FILE_ART_PREFIX}{own_file.group('file')}"
     scryfall = _SCRYFALL_ART.match(content.strip())
     if scryfall:
         inner = _parse_art_content(scryfall.group("art"))
-        if inner is None or inner.startswith(("mpc:", "scryfall:")):
+        if inner is None or inner.startswith(("mpc:", "scryfall:", FILE_ART_PREFIX)):
             return None
         return f"scryfall:{inner}"
     text = content.strip().lower()
@@ -250,7 +264,12 @@ def _split_front_back(name_part: str, raw_line: str) -> tuple[str, str | None]:
     return name_part[:idx], name_part[idx + 1 :]
 
 
-def parse_deck_file(file_path: str) -> tuple[str, list[DeckCard]]:
+def is_file_art(art: str | None) -> bool:
+    """Whether ``art`` is an own-image ``[file:<name>]`` marker."""
+    return art is not None and art.startswith(FILE_ART_PREFIX)
+
+
+def parse_deck_file(file_path: str, default_tcg: str | None = None) -> tuple[str, list[DeckCard]]:
     """Read a decklist .txt file and return (deck_name, cards).
 
     Each non-empty line is expected to follow the format:
@@ -286,19 +305,45 @@ def parse_deck_file(file_path: str) -> tuple[str, list[DeckCard]]:
     independently (``back_name`` / ``back_art`` / ``back_foil``). PDF
     grouping (regular vs foil) always follows the front-face foil flag so
     front/back pages stay aligned.
+
+    One deck can mix games: a section line ``[mtg]`` / ``[lorcana]`` /
+    ``[local]`` ... sets ``DeckCard.tcg`` for the lines below it (lines
+    before any section get ``default_tcg``)::
+
+        [mtg]
+        1 Lightning Bolt
+        [lorcana]
+        1 Hades - King of Olympus [enchanted]
+        [local]
+        3 my_token.png
     """
     path = Path(file_path)
     with path.open("r", encoding="utf-8") as f:
-        return path.stem, parse_deck_lines(f)
+        return path.stem, parse_deck_lines(f, default_tcg)
 
 
-def format_deck(cards: Iterable[DeckCard]) -> str:
+def format_deck(cards: Iterable[DeckCard], default_tcg: str | None = None) -> str:
     """Serialize cards back into decklist text (inverse of :func:`parse_deck_text`).
 
     Each entry becomes ``<qty> <name> [art] *F* [/ <back> [art] *F*]`` so the
     output can be fed to the CLI or the web UI to rebuild the same deck.
+
+    A ``[tcg]`` section line is written wherever the game changes (cards
+    without ``tcg`` count as ``default_tcg``); a deck whose cards all belong
+    to ``default_tcg`` is written without sections.
     """
-    return "".join(f"{format_deck_line(card)}\n" for card in cards)
+    cards = list(cards)
+    games = [card.tcg or default_tcg for card in cards]
+    if set(games) <= {default_tcg}:
+        return "".join(f"{format_deck_line(card)}\n" for card in cards)
+    lines: list[str] = []
+    section: str | None = None
+    for card, game in zip(cards, games):
+        if game is not None and game != section:
+            lines.append(f"[{game}]")
+            section = game
+        lines.append(format_deck_line(card))
+    return "".join(f"{line}\n" for line in lines)
 
 
 def format_deck_line(card: DeckCard) -> str:
@@ -320,24 +365,34 @@ def _format_face(name: str, art: str | None, foil: bool) -> str:
     return text
 
 
-def parse_deck_text(text: str) -> list[DeckCard]:
+def parse_deck_text(text: str, default_tcg: str | None = None) -> list[DeckCard]:
     """Parse decklist contents given as a string (e.g. pasted in the web UI).
 
     Same line format as :func:`parse_deck_file`.
     """
-    return parse_deck_lines(text.splitlines())
+    return parse_deck_lines(text.splitlines(), default_tcg)
 
 
-def parse_deck_lines(lines: Iterable[str]) -> list[DeckCard]:
+def parse_deck_lines(lines: Iterable[str], default_tcg: str | None = None) -> list[DeckCard]:
     """Parse decklist lines into cards (see :func:`parse_deck_file` for the format).
+
+    Args:
+        lines: Decklist lines.
+        default_tcg: ``DeckCard.tcg`` of the lines before any ``[tcg]``
+            section line (``None``: the deck's strategy).
 
     Raises:
         ValueError: If a non-empty line does not follow the decklist format.
     """
     cards: list[DeckCard] = []
+    tcg = default_tcg
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
+            continue
+        section = _SECTION.match(line)
+        if section:
+            tcg = section.group("tcg").lower()
             continue
         match = re.match(r"^(\d+)\s+(.+)$", line)
         if not match:
@@ -374,6 +429,7 @@ def parse_deck_lines(lines: Iterable[str]) -> list[DeckCard]:
                 back_art=back_art,
                 back_foil=back_foil,
                 front_only=front_only,
+                tcg=tcg,
             )
         )
     return cards

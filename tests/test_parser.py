@@ -75,3 +75,36 @@ def test_scryfall_marker_wraps_an_mtg_art():
 
 def test_format_deck_line_minimal():
     assert format_deck_line(DeckCard(quantity=2, name="Island")) == "2 Island"
+
+
+def test_sections_set_the_game_of_the_lines_below():
+    cards = parse_deck_text(
+        "1 Lightning Bolt\n[Lorcana]\n1 Hades - King of Olympus [enchanted]\n[local]\n3 Pikachu\n",
+        default_tcg="mtg",
+    )
+
+    assert [(c.name, c.tcg) for c in cards] == [
+        ("Lightning Bolt", "mtg"),
+        ("Hades - King of Olympus", "lorcana"),
+        ("Pikachu", "local"),
+    ]
+    assert cards[1].art == "enchanted"
+    assert parse_deck_text("1 Lightning Bolt")[0].tcg is None
+
+
+def test_format_deck_writes_sections_only_for_mixed_decks():
+    mixed = "[mtg]\n1 Lightning Bolt\n[lorcana]\n1 Hades\n[mtg]\n2 Island\n"
+    cards = parse_deck_text("1 Lightning Bolt\n[lorcana]\n1 Hades\n[mtg]\n2 Island\n")
+
+    assert format_deck(cards, default_tcg="mtg") == mixed
+    assert parse_deck_text(mixed) == [c.model_copy(update={"tcg": c.tcg or "mtg"}) for c in cards]
+    assert format_deck(parse_deck_text("[mtg]\n1 Island\n"), default_tcg="mtg") == "1 Island\n"
+
+
+def test_file_marker_keeps_the_file_name_on_any_face():
+    text = "1 Lightning Bolt [file:Lightning Bolt-1A2b3c.png] *F* / Mountain [FILE: My Mountain.jpg]\n"
+    card = parse_deck_text(text)[0]
+
+    assert (card.name, card.art, card.foil) == ("Lightning Bolt", "file:Lightning Bolt-1A2b3c.png", True)
+    assert (card.back_name, card.back_art) == ("Mountain", "file:My Mountain.jpg")
+    assert format_deck([card]) == text.replace("[FILE: ", "[file:")

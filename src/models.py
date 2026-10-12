@@ -22,7 +22,8 @@ class DeckCard(BaseModel):
             "(Lorcana: '[enchanted]'; MTG: '[m21]', '[2x2:117]', '[borderless]', "
             "'[m21 borderless]'). Only honored by strategies that support art "
             "selection (Lorcana, MTG); when unset the strategy default applies (best "
-            "available art)."
+            "available art). '[file:<file name>]' (any game) prints that image "
+            "from the local images directory instead."
         ),
     )
     back_name: str | None = Field(
@@ -56,6 +57,14 @@ class DeckCard(BaseModel):
             "Print the front face only, without any back (written as '/ -' in the "
             "decklist: '1 Delver of Secrets / -'). Skips the automatic back face "
             "a strategy would add (e.g. MTG double-faced cards)."
+        ),
+    )
+    tcg: str | None = Field(
+        default=None,
+        description=(
+            "Strategy that fetches this card's images, set by a '[mtg]' / "
+            "'[lorcana]' / '[local]' ... section line in the decklist so one deck "
+            "can mix games. None uses the deck's strategy (--tcg / web selector)."
         ),
     )
 

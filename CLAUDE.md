@@ -14,7 +14,7 @@ tgc-card-image-downloader/
 ├── output/<tcg>/<mazo>/  # images/*.png + *.pdf
 ├── data/                 # caché (volumen)
 ├── src/
-│   ├── main.py       # CLI: argparse, registro de estrategias, códigos de salida
+│   ├── main.py       # CLI: argparse, registro de estrategias, secciones [juego], códigos de salida
 │   ├── app.py        # UI web Streamlit: pestañas por PDF, selector de arte, descargas
 │   ├── parser.py     # .txt / texto ↔ list[DeckCard] (parse_deck_* y format_deck)
 │   ├── models.py     # pydantic: DeckCard, ResolvedCard (DownloadResult no se usa)
@@ -27,7 +27,7 @@ tgc-card-image-downloader/
 └── tests/
     ├── mocks.py      # FakeSession/FakeResponse, FakeStrategy, cargadores de fixtures
     ├── test_local.py · test_lorcana.py · test_mtg.py · test_pokemon.py
-    ├── test_exporter.py  # generación de PDFs · test_pdf.py (PdfWriter) · test_parser.py · test_app.py (AppTest)
+    ├── test_exporter.py  # generación de PDFs · test_pdf.py (PdfWriter) · test_parser.py · test_main.py (CLI) · test_app.py (AppTest)
     └── fixtures/     # decks/*.txt, images/, responses/*.html|json, card.png, card_back.png
 ```
 
@@ -35,7 +35,9 @@ tgc-card-image-downloader/
 
 - App de línea de comandos: procesa un mazo por ejecución, no hay servidor. UI web opcional con Streamlit (`src/app.py`) que reutiliza el mismo núcleo.
 - Patrón Strategy: `TCGStrategy` (`src/strategies/base.py`) define `fetch_card_image` (abstracto), `fetch_card_back_image` (opcional, devuelve `False` por defecto) y `list_art_options` (opcional, `[]` por defecto; MTG y Lorcana devuelven `ArtOption(value=<marcador [art]>, label, image_url)` para el selector de arte de la web; MTG lista primero todas las imágenes de MPC (`mpc:<id>`, por DPI) y luego Scryfall como `set:num`), más los atributos `name` y `supports_art`.
-- Una estrategia por juego o fuente. `Exporter` recibe la estrategia inyectada y no depende del juego.
+- Una estrategia por juego o fuente. `Exporter` recibe la estrategia del mazo inyectada y no depende del juego.
+- Mazos mixtos: una línea `[mtg]` / `[lorcana]` / `[local]` / `[pokemon]` fija `DeckCard.tcg` de las líneas siguientes (sin sección → `None` = estrategia del mazo). `Exporter(strategy_factory=...)` crea una vez la estrategia de cada otro juego (`_strategy_for`); `prefetch` se llama por juego; las imágenes de otro juego llevan prefijo `<tcg>_` (`_game_key`). `format_deck(cards, default_tcg)` solo escribe secciones si alguna carta no es del juego por defecto. `main` valida las secciones (desconocida → código 2) y la web también (`_check_games`).
+- Arte propio `[file:<fichero>]` (cualquier juego y cara): el exporter lo copia con la estrategia `local` (carpeta `--local-dir`), sin `pin_art`; el reverso automático se pide con `art=None` (`_strategy_art`). La web lo crea al subir una imagen o pegar una URL (`_save_custom_image`: guarda los bytes tal cual con un hash en el nombre) en el diálogo de arte o en «➕ Añadir cartas».
 - Arranque: `python src/main.py ...` o `python -m src.main ...`. Web: `streamlit run src/app.py` o `docker compose up web` (puerto 8501).
 
 ## Flujo de una ejecución
@@ -68,7 +70,8 @@ tgc-card-image-downloader/
 ## Tests
 
 - Ejecutar: `pip install -r requirements-dev.txt` y `python -m pytest`.
-- UI web: `streamlit.testing.v1.AppTest` con la estrategia `local` y `tests/fixtures/images` (sin red).
+- UI web: `streamlit.testing.v1.AppTest` con la estrategia `local` y `tests/fixtures/images` (sin red). Las cartas de otro juego se sirven sin red con `_resolve_local_deck(..., lorcana=FakeStrategy())` (rellena `session_state["extra_strategies"]`); las pruebas de imágenes propias usan una copia de las imágenes en `tmp_path` (`images_dir=`) porque se escribe en ella.
+- CLI: `tests/test_main.py` (mazo `[local]` dentro de otro juego, sin red).
 - Streamlit reejecuta `app.py` en cada interacción: lo que se guarde en `session_state` y se compare debe ser por valor (tuplas/modelos de `src.models`), no clases definidas en `app.py`. En `AppTest` las pestañas ocultas no se pintan: cambiar con `session_state["preview-tab"]`.
 - Sin red: cada test sustituye `strategy._session` por `FakeSession({subcadena_url: FakeResponse})`; la primera ruta contenida en `url?k=v` gana y el resto devuelve 404.
 - Los mocks usan solo ficheros estáticos de `tests/fixtures/` (nunca `input/`): mazos en `decks/`, imágenes locales en `images/` y respuestas HTTP en `responses/`, cargadas con `deck()`, `response_text()`, `response_json()` e `image_response()`.

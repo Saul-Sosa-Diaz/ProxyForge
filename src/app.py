@@ -42,7 +42,7 @@ if __package__ in (None, ""):
 from src.exporter import PRINT_DPI, Exporter, estimate_print_dpi
 from src.main import _STRATEGY_REGISTRY, _make_strategy
 from src.models import ArtOption, DeckCard, ResolvedCard
-from src.parser import format_deck, parse_deck_text
+from src.parser import FILE_ART_PREFIX, format_deck, is_file_art, parse_deck_text
 from src.strategies.base import TCGStrategy
 from src.strategies.local import LocalStrategy
 
@@ -76,6 +76,9 @@ ART_THUMBNAIL_RETRIES = 3
 ART_THUMBNAIL_TIMEOUT = 20
 # Scryfall's image CDN rejects the default python-requests User-Agent (HTTP 400).
 ART_THUMBNAIL_HEADERS = {"User-Agent": "tgc-card-image-downloader/1.0", "Accept": "image/*"}
+# Own images ('[file:...]' arts) kept as uploaded; anything else becomes PNG.
+CUSTOM_IMAGE_EXTENSIONS = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
+CUSTOM_IMAGE_TYPES = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"]
 
 TCG_LABELS = {
     "local": "Imágenes locales",
@@ -277,11 +280,24 @@ def _clean_deck_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or DEFAULT_DECK_NAME
 
 
-def _get_strategy(ctx: _Context) -> TCGStrategy:
-    """Reuse one strategy per context (keeps HTTP sessions and caches warm)."""
-    key = (ctx.tcg, ctx.local_dir)
+def _get_strategy(ctx: _Context, tcg: str | None = None) -> TCGStrategy:
+    """Reuse one strategy per game (keeps HTTP sessions and caches warm).
+
+    ``tcg`` defaults to the deck's game; other games (cards of a mixed deck)
+    are kept in ``st.session_state.extra_strategies``.
+    """
+    tcg = tcg or ctx.tcg
+    local_dir = ctx.local_dir if tcg == "local" else None
+    if tcg != ctx.tcg:
+        strategies: dict[tuple[str, str | None], TCGStrategy] = st.session_state.setdefault(
+            "extra_strategies", {}
+        )
+        if (tcg, local_dir) not in strategies:
+            strategies[(tcg, local_dir)] = _make_strategy(tcg, local_dir)
+        return strategies[(tcg, local_dir)]
+    key = (tcg, local_dir)
     if st.session_state.get("strategy_key") != key:
-        st.session_state.strategy = _make_strategy(ctx.tcg, ctx.local_dir)
+        st.session_state.strategy = _make_strategy(tcg, local_dir)
         st.session_state.strategy_key = key
     return st.session_state.strategy
 
@@ -291,34 +307,110 @@ def _get_exporter(ctx: _Context, dpi: int | None = None) -> Exporter:
         strategy=_get_strategy(ctx),
         output_base_dir=str(Path(ctx.output_dir) / ctx.tcg),
         target_dpi=dpi,
+        strategy_factory=lambda tcg: _get_strategy(ctx, tcg),
     )
 
 
-def _edited_card(card: DeckCard, name: str, quantity: int, foil: bool) -> DeckCard:
+def _card_game(card: DeckCard, ctx: _Context) -> str:
+    """Game whose strategy fetches ``card`` (its section, else the deck's)."""
+    return card.tcg or ctx.tcg
+
+
+def _own_game(tcg: str, ctx: _Context) -> str | None:
+    """``DeckCard.tcg`` for a card of game ``tcg`` (``None`` = the deck's)."""
+    return None if tcg == ctx.tcg else tcg
+
+
+def _edited_card(
+    card: DeckCard, name: str, quantity: int, foil: bool, tcg: str | None
+) -> DeckCard:
     """Apply form edits to a card, validating the name through the parser.
 
     A renamed card drops its previous ``[art]`` (it belonged to another
-    card) unless the new name carries its own marker.
+    card) unless the new name carries its own marker; moving the card to
+    another game (``tcg``) drops the source-specific arts of both faces
+    (own ``[file:...]`` images stay).
 
     Raises:
         ValueError: If the name is not a valid decklist entry.
     """
     parsed = parse_deck_text(f"{quantity} {name.strip()}")[0]
     art = parsed.art if parsed.art or parsed.name != card.name else card.art
-    return card.model_copy(
-        update={"name": parsed.name, "art": art, "quantity": quantity, "foil": foil}
-    )
+    update = {"name": parsed.name, "art": art, "quantity": quantity, "foil": foil}
+    if tcg != card.tcg:
+        update["tcg"] = tcg
+        if not parsed.art and not is_file_art(art):
+            update["art"] = None
+        if not is_file_art(card.back_art):
+            update["back_art"] = None
+    return card.model_copy(update=update)
 
 
-def _art_options(ctx: _Context, card_name: str) -> list[ArtOption]:
+def _art_options(ctx: _Context, card: DeckCard) -> list[ArtOption]:
     """Art options of a card, fetched once per session."""
     cache: dict[tuple[str, str], list[ArtOption]] = st.session_state.setdefault(
         "art_options", {}
     )
-    key = (ctx.tcg, card_name)
+    game = _card_game(card, ctx)
+    key = (game, card.name)
     if key not in cache:
-        cache[key] = _get_strategy(ctx).list_art_options(card_name)
+        cache[key] = _get_strategy(ctx, game).list_art_options(card.name)
     return cache[key]
+
+
+def _save_custom_image(data: bytes, card_name: str, local_dir: str | None) -> str:
+    """Store an own card image in the local images folder.
+
+    PNG, JPEG and WebP files are kept byte for byte (original quality);
+    other formats are converted to PNG. The file name carries a content
+    hash, so a new image never overwrites an earlier one.
+
+    Returns:
+        The file name, to use as a ``[file:<name>]`` art marker.
+
+    Raises:
+        ValueError: If ``data`` is not an image.
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.load()
+            ext = CUSTOM_IMAGE_EXTENSIONS.get(img.format or "")
+            if ext is None:
+                buffer = io.BytesIO()
+                img.convert("RGBA" if "A" in img.getbands() else "RGB").save(buffer, "PNG")
+                data, ext = buffer.getvalue(), ".png"
+    except (OSError, ValueError) as exc:
+        raise ValueError("El fichero no es una imagen válida.") from exc
+    stem = re.sub(r"[^\w\s()-]+", "", card_name).strip()[:60] or "carta"
+    file_name = f"{stem}-{hashlib.sha1(data).hexdigest()[:10]}{ext}"
+    folder = Path(local_dir or LocalStrategy.DEFAULT_IMAGES_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / file_name).write_bytes(data)
+    return file_name
+
+
+def _download_custom_image(url: str) -> bytes:
+    """Download an own card image from a URL.
+
+    Raises:
+        ValueError: If the URL is not http(s) or the download fails.
+    """
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("La URL debe empezar por http:// o https://.")
+    try:
+        resp = requests.get(url, timeout=ART_THUMBNAIL_TIMEOUT, headers=ART_THUMBNAIL_HEADERS)
+    except requests.RequestException as exc:
+        raise ValueError(f"No se pudo descargar la imagen: {exc}") from exc
+    if resp.status_code != 200:
+        raise ValueError(f"No se pudo descargar la imagen (HTTP {resp.status_code}).")
+    return resp.content
+
+
+def _custom_image_data(uploaded, url: str) -> bytes:
+    """Bytes of an uploaded image, or else of the image at ``url``."""
+    if uploaded is not None:
+        return uploaded.getvalue()
+    return _download_custom_image(url.strip())
 
 
 def _replace_card(index: int, item: ResolvedCard) -> None:
@@ -345,13 +437,15 @@ def _render_sidebar() -> tuple[_Context, int | None]:
             list(_STRATEGY_REGISTRY),
             format_func=lambda key: TCG_LABELS.get(key, key),
         )
-        local_dir = None
-        if tcg == "local":
-            local_dir = st.text_input(
-                "Carpeta de imágenes locales",
-                LocalStrategy.DEFAULT_IMAGES_DIR,
-                help="Los nombres del mazo deben coincidir con los ficheros.",
-            )
+        local_dir = st.text_input(
+            "Carpeta de imágenes locales",
+            LocalStrategy.DEFAULT_IMAGES_DIR,
+            help=(
+                "Para las cartas de «Imágenes locales» (los nombres del mazo deben "
+                "coincidir con los ficheros) y las imágenes propias que subas, en "
+                "cualquier juego."
+            ),
+        )
         output_dir = st.text_input("Carpeta de salida", DEFAULT_OUTPUT_DIR)
         dpi = st.selectbox(
             "Resolución del PDF (DPI)",
@@ -376,7 +470,15 @@ def _render_deck_input(ctx: _Context) -> None:
         text = st.text_area(
             "…o pega la decklist",
             height=200,
-            placeholder="4 Lightning Bolt [m21]\n1 Delver of Secrets\n2 Island *F*",
+            placeholder=(
+                "4 Lightning Bolt [m21]\n1 Delver of Secrets\n2 Island *F*\n"
+                "[lorcana]\n1 Hades - King of Olympus [enchanted]\n[local]\n3 mi_token.png"
+            ),
+            help=(
+                "Las líneas sin sección usan el juego elegido en Ajustes. Una línea "
+                "«[mtg]», «[lorcana]», «[pokemon]» o «[local]» cambia el juego de las "
+                "cartas que vienen debajo, para mezclar juegos en los mismos PDFs."
+            ),
         )
         default_name = DEFAULT_DECK_NAME
     deck_name = _clean_deck_name(st.text_input("Nombre del mazo", default_name))
@@ -390,6 +492,8 @@ def _render_deck_input(ctx: _Context) -> None:
         return
     if not cards:
         st.warning("La decklist no contiene cartas.")
+        return
+    if not _check_games(cards):
         return
 
     progress = st.progress(0.0, text="Buscando imágenes…")
@@ -409,6 +513,20 @@ def _render_deck_input(ctx: _Context) -> None:
         resolved=resolved, deck_name=deck_name, context=ctx, pdfs=[], deck_text=text
     )
     _close_art_dialog()
+
+
+def _check_games(cards: list[DeckCard]) -> bool:
+    """Show an error (and return ``False``) for ``[section]`` games that do not exist."""
+    unknown = sorted({card.tcg for card in cards if card.tcg} - set(_STRATEGY_REGISTRY))
+    if unknown:
+        st.error(
+            "Sección de juego desconocida: "
+            + ", ".join(f"`[{tcg}]`" for tcg in unknown)
+            + ". Usa "
+            + ", ".join(f"`[{tcg}]`" for tcg in _STRATEGY_REGISTRY)
+            + "."
+        )
+    return not unknown
 
 
 def _render_front_back(item: ResolvedCard, pair_number: int) -> None:
@@ -433,8 +551,13 @@ def _render_card(
     pair_number: int | None = None,
 ) -> None:
     card = item.card
+    game = _card_game(card, ctx)
     badges = [f"**{card.quantity}×**"]
-    if card.art:
+    if game != ctx.tcg:
+        badges.append(f"🎲 {TCG_LABELS.get(game, game)}")
+    if is_file_art(card.art):
+        badges.append("📤 imagen propia")
+    elif card.art:
         badges.append(f"🎨 `{card.art}`")
     if card.foil:
         badges.append("✨ foil")
@@ -480,17 +603,19 @@ def _render_card(
     ):
         _restore_back(index, ctx, deck_name)
 
-    strategy = _get_strategy(ctx)
     art_col, edit_col = st.columns(2)
-    if strategy.supports_art and art_col.button("🎨 Arte", key=f"art-{index}"):
+    # Every card can take an own image; the picker also lists the source's arts.
+    if art_col.button("🎨 Arte", key=f"art-{index}"):
         st.session_state.art_dialog = index
     with edit_col.popover("✏️ Editar"):
         with st.form(f"edit-{index}"):
             name = st.text_input("Nombre", card.name)
             quantity = st.number_input("Copias", min_value=1, value=card.quantity, step=1)
             foil = st.checkbox("Foil", card.foil)
+            new_game = _game_selectbox("Juego", game, key=f"edit-game-{index}")
             if st.form_submit_button("Aplicar", type="primary"):
-                _apply_edit(index, item, ctx, deck_name, name, int(quantity), foil)
+                tcg = card.tcg if new_game == game else _own_game(new_game, ctx)
+                _apply_edit(index, item, ctx, deck_name, name, int(quantity), foil, tcg)
         if st.button("🗑️ Quitar del mazo", key=f"remove-{index}"):
             st.session_state.resolved.pop(index)
             st.session_state.pdfs = []
@@ -562,13 +687,14 @@ def _apply_edit(
     name: str,
     quantity: int,
     foil: bool,
+    tcg: str | None,
 ) -> None:
     try:
-        card = _edited_card(item.card, name, quantity, foil)
+        card = _edited_card(item.card, name, quantity, foil, tcg)
     except ValueError as exc:
         st.error(str(exc))
         return
-    unchanged_images = card.name == item.card.name and card.art == item.card.art
+    unchanged_images = (card.name, card.art, card.tcg) == (item.card.name, item.card.art, item.card.tcg)
     if unchanged_images and item.front_path is not None:
         # Only quantity/finish changed: the images stay valid.
         _replace_card(index, item.model_copy(update={"card": card}))
@@ -602,16 +728,22 @@ def _art_dialog(index: int) -> None:
     )
     if card.art and info_col.button("↩️ Volver al arte por defecto"):
         _choose_art(index, item, ctx, deck_name, None)
-    if info_col.button(
+    game = _card_game(card, ctx)
+    supports_art = _get_strategy(ctx, game).supports_art
+    if supports_art and info_col.button(
         "🔄 Recargar artes",
         help="Vuelve a consultar las fuentes (p. ej. si MPC Autofill no respondió).",
     ):
-        st.session_state.get("art_options", {}).pop((ctx.tcg, card.name), None)
+        st.session_state.get("art_options", {}).pop((game, card.name), None)
 
-    with st.spinner("Buscando artes disponibles…"):
-        options = _art_options(ctx, card.name)
+    options: list[ArtOption] = []
+    if supports_art:
+        with st.spinner("Buscando artes disponibles…"):
+            options = _art_options(ctx, card)
+    _render_custom_art(index, item, ctx, deck_name, expanded=not options)
     if not options:
-        st.info("No hay artes alternativos para esta carta.")
+        if supports_art:
+            st.info("No hay artes alternativos para esta carta: usa una imagen propia.")
         return
 
     total = len(options)
@@ -691,13 +823,54 @@ def _filter_art_options(options: list[ArtOption], query: str) -> list[ArtOption]
     ]
 
 
-def _choose_art(
-    index: int, item: ResolvedCard, ctx: _Context, deck_name: str, art: str | None
+def _render_custom_art(
+    index: int, item: ResolvedCard, ctx: _Context, deck_name: str, expanded: bool
 ) -> None:
-    card = item.card.model_copy(update={"art": art})
+    """Own image for one face: an uploaded file or a URL, for any game."""
+    card = item.card
+    with st.expander("📤 Usar una imagen propia", expanded=expanded):
+        st.caption(
+            "Sube una imagen o pega su URL. Se guarda en la carpeta de imágenes locales "
+            "y la decklist la recuerda como `[file:…]`, en cualquier juego."
+        )
+        back = False
+        if card.back_name:
+            face = st.radio(
+                "Cara", ("Anverso", "Reverso"), horizontal=True, key=f"custom-face-{index}"
+            )
+            back = face == "Reverso"
+        uploaded = st.file_uploader("Imagen", type=CUSTOM_IMAGE_TYPES, key=f"custom-file-{index}")
+        url = st.text_input("…o URL de la imagen", key=f"custom-url-{index}")
+        if st.button(
+            "Usar esta imagen",
+            key=f"custom-use-{index}",
+            type="primary",
+            disabled=uploaded is None and not url.strip(),
+        ):
+            try:
+                file_name = _save_custom_image(
+                    _custom_image_data(uploaded, url),
+                    card.back_name if back else card.name,
+                    ctx.local_dir,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            _choose_art(index, item, ctx, deck_name, f"{FILE_ART_PREFIX}{file_name}", back=back)
+
+
+def _choose_art(
+    index: int,
+    item: ResolvedCard,
+    ctx: _Context,
+    deck_name: str,
+    art: str | None,
+    back: bool = False,
+) -> None:
+    card = item.card.model_copy(update={"back_art" if back else "art": art})
     with st.spinner("Descargando el arte elegido…"):
         updated = _get_exporter(ctx).resolve_images(deck_name, [card])[0]
-    if updated.front_path is None:
+    if updated.front_path is None or (back and updated.back_path is None):
         st.error("No se pudo descargar ese arte; se mantiene el actual.")
         return
     _replace_card(index, updated)
@@ -756,6 +929,7 @@ def _render_preview(current: _Context, dpi: int | None) -> None:
 
     _render_pdf_actions(dpi, has_cards=bool(found))
     _render_decklist(resolved, ctx, deck_name)
+    _render_add_cards(ctx, deck_name)
 
     groups = [
         (group, [(i, r) for i, r in enumerate(resolved) if group.matches(r)])
@@ -801,6 +975,85 @@ def _render_preview(current: _Context, dpi: int | None) -> None:
             _render_card_grid(failed, ctx, deck_name, dual=False)
 
 
+def _game_selectbox(label: str, value: str, key: str) -> str:
+    games = list(_STRATEGY_REGISTRY)
+    return st.selectbox(
+        label,
+        games,
+        index=games.index(value) if value in games else 0,
+        format_func=lambda game: TCG_LABELS.get(game, game),
+        key=key,
+    )
+
+
+def _render_add_cards(ctx: _Context, deck_name: str) -> None:
+    """Append cards of any game (or with an own image) to the current deck."""
+    with st.expander("➕ Añadir cartas"):
+        by_name, by_image = st.columns(2)
+        with by_name, st.form("add-cards", clear_on_submit=True):
+            st.markdown("**Por nombre, de cualquier juego**")
+            game = _game_selectbox("Juego", ctx.tcg, key="add-game")
+            text = st.text_area(
+                "Líneas de decklist",
+                placeholder="1 Lightning Bolt [m21]\n2 Hades - King of Olympus [enchanted] *F*",
+                help="Mismo formato que la decklist; también admite secciones «[juego]».",
+            )
+            if st.form_submit_button("➕ Añadir", type="primary"):
+                try:
+                    cards = parse_deck_text(text, default_tcg=_own_game(game, ctx))
+                except ValueError as exc:
+                    st.error(f"No se pudo leer: {exc}")
+                    return
+                if cards and _check_games(cards):
+                    _add_cards(ctx, deck_name, cards)
+        with by_image, st.form("add-custom-card", clear_on_submit=True):
+            st.markdown("**Con una imagen propia**")
+            uploaded = st.file_uploader("Imagen", type=CUSTOM_IMAGE_TYPES)
+            url = st.text_input("…o URL de la imagen")
+            name = st.text_input("Nombre", placeholder="Por defecto, el del fichero")
+            quantity = st.number_input("Copias", min_value=1, value=1, step=1)
+            foil = st.checkbox("Foil")
+            if st.form_submit_button("➕ Añadir", type="primary"):
+                if uploaded is None and not url.strip():
+                    st.error("Sube una imagen o pega su URL.")
+                    return
+                default_name = Path(uploaded.name).stem if uploaded is not None else "Carta propia"
+                card_name = name.strip() or default_name
+                try:
+                    # Validates the name ('/' would split it into two faces).
+                    parsed = parse_deck_text(f"{int(quantity)} {card_name}")[0]
+                    file_name = _save_custom_image(
+                        _custom_image_data(uploaded, url), parsed.name, ctx.local_dir
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                    return
+                # 'local': no strategy should look the name up (e.g. an MTG back).
+                card = parsed.model_copy(
+                    update={
+                        "art": f"{FILE_ART_PREFIX}{file_name}",
+                        "foil": foil,
+                        "back_name": None,
+                        "front_only": False,
+                        "tcg": _own_game("local", ctx),
+                    }
+                )
+                _add_cards(ctx, deck_name, [card])
+
+
+def _add_cards(ctx: _Context, deck_name: str, cards: list[DeckCard]) -> None:
+    with st.spinner("Buscando imágenes…"):
+        added = _get_exporter(ctx).resolve_images(deck_name, cards)
+    st.session_state.resolved.extend(added)
+    st.session_state.pdfs = []
+    missing = sum(1 for item in added if item.front_path is None)
+    names = added[0].card.name if len(added) == 1 else f"{len(added)} cartas"
+    st.session_state.flash = f"Añadido: {names}"
+    if missing:
+        st.session_state.flash_warning = f"{missing} no encontrada(s): revisa «{FAILED_TAB}»."
+    st.rerun()
+
+
 def _render_pdf_actions(dpi: int | None, has_cards: bool) -> None:
     resolved: list[ResolvedCard] = st.session_state.resolved
     ctx: _Context = st.session_state.context
@@ -836,7 +1089,7 @@ def _render_pdf_actions(dpi: int | None, has_cards: bool) -> None:
 def _save_decklist(resolved: list[ResolvedCard], ctx: _Context, deck_name: str) -> Path:
     """Write ``<output>/<tcg>/<deck>/<deck>.txt`` when its contents changed."""
     path = Path(ctx.output_dir) / ctx.tcg / deck_name / f"{deck_name}.txt"
-    text = format_deck(item.card for item in resolved)
+    text = format_deck((item.card for item in resolved), default_tcg=ctx.tcg)
     try:
         unchanged = path.read_text(encoding="utf-8") == text
     except OSError:
@@ -847,10 +1100,10 @@ def _save_decklist(resolved: list[ResolvedCard], ctx: _Context, deck_name: str) 
     return path
 
 
-def _changed_lines(original: str, current: str) -> int:
+def _changed_lines(original: str, current: str, default_tcg: str | None = None) -> int:
     """Entries added or modified in ``current`` (formatting-only edits ignored)."""
     try:
-        before = format_deck(parse_deck_text(original)).splitlines()
+        before = format_deck(parse_deck_text(original), default_tcg).splitlines()
     except ValueError:
         before = original.splitlines()
     diff = difflib.ndiff(before, current.splitlines())
@@ -865,13 +1118,13 @@ def _render_decklist(resolved: list[ResolvedCard], ctx: _Context, deck_name: str
     PDFs will contain and can be fed back to the web UI or the CLI.
     """
     original: str = st.session_state.get("deck_text", "")
-    current = format_deck(item.card for item in resolved)
+    current = format_deck((item.card for item in resolved), default_tcg=ctx.tcg)
     try:
         path = _save_decklist(resolved, ctx, deck_name)
     except OSError as exc:
         logger.warning("Could not save the decklist: %s", exc)
         path = None
-    changed = _changed_lines(original, current)
+    changed = _changed_lines(original, current, ctx.tcg)
 
     with st.expander("📝 Decklist · original ↔ con tus cambios", expanded=True):
         left, right = st.columns(2)

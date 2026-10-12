@@ -53,14 +53,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "-t",
         required=True,
         choices=["local", "lorcana", "mtg", "pokemon"],
-        help="TCG strategy to apply for image fetching.",
+        help=(
+            "TCG strategy to apply for image fetching. Decklist lines under a "
+            "'[mtg]' / '[lorcana]' / '[local]' / '[pokemon]' section use that "
+            "game instead, so one deck can mix games."
+        ),
     )
     parser.add_argument(
         "--local-dir",
         default=LocalStrategy.DEFAULT_IMAGES_DIR,
         help=(
-            "Directory with local card images (local strategy only). "
-            "Card names in the decklist must match the local file names."
+            "Directory with local card images ('local' cards and '[file:<name>]' "
+            "arts of any game). Card names in the decklist must match the local "
+            "file names."
         ),
     )
     parser.add_argument(
@@ -133,6 +138,16 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("Parsed deck '%s' with %d unique card entries.", deck_name, len(cards))
 
+    unknown = sorted({card.tcg for card in cards if card.tcg} - set(_STRATEGY_REGISTRY))
+    if unknown:
+        logger.error(
+            "Unknown game section(s) in '%s': %s (valid: %s).",
+            args.input,
+            ", ".join(f"[{tcg}]" for tcg in unknown),
+            ", ".join(_STRATEGY_REGISTRY),
+        )
+        return 2
+
     try:
         strategy = _make_strategy(args.tcg, args.local_dir, args.mpc_url)
     except ValueError as exc:
@@ -143,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         strategy=strategy,
         output_base_dir=args.output + f"/{args.tcg}",
         target_dpi=args.dpi,
+        # Cards under a '[lorcana]' / '[local]' ... section use that game.
+        strategy_factory=lambda tcg: _make_strategy(tcg, args.local_dir, args.mpc_url),
     )
     try:
         pdf_path = exporter.export_deck(deck_name, cards)

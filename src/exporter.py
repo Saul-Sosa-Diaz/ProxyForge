@@ -11,7 +11,7 @@ from typing import NamedTuple
 from PIL import Image
 
 from .models import DeckCard, ResolvedCard
-from .parser import format_deck
+from .parser import FILE_ART_PREFIX, format_deck, is_file_art
 from .pdf import PdfWriter, draw_image_ops, line_ops
 from .strategies.base import TCGStrategy
 
@@ -84,8 +84,21 @@ class Exporter:
         page_margin_mm: float = PAGE_MARGIN_MM,
         card_gap_mm: float = CARD_GAP_MM,
         target_dpi: int | None = None,
+        strategy_factory: Callable[[str], TCGStrategy] | None = None,
     ) -> None:
+        """Configure the exporter.
+
+        Args:
+            strategy: Strategy of the deck: fetches the cards without
+                ``DeckCard.tcg`` (and those of its own game).
+            strategy_factory: Builds the strategy of any other game a card
+                asks for (``[mtg]`` / ``[lorcana]`` ... decklist sections, and
+                ``local`` for ``[file:...]`` arts); each is built once. May
+                raise ``ValueError`` for unknown games: those cards then fail.
+        """
         self.strategy = strategy
+        self.strategy_factory = strategy_factory
+        self._strategies: dict[str, TCGStrategy] = {strategy.name: strategy}
         self.output_base = Path(output_base_dir)
         self.page_width_mm = page_width_mm
         self.page_height_mm = page_height_mm
@@ -119,7 +132,10 @@ class Exporter:
         deck_dir = self.output_base / deck_name
         deck_dir.mkdir(parents=True, exist_ok=True)
         path = deck_dir / f"{deck_name}.txt"
-        path.write_text(format_deck(item.card for item in resolved), encoding="utf-8")
+        path.write_text(
+            format_deck((item.card for item in resolved), default_tcg=self.strategy.name),
+            encoding="utf-8",
+        )
         logger.info("Pinned decklist written to %s", path)
         return path
 
@@ -152,8 +168,8 @@ class Exporter:
         """
         images_dir = self.output_base / deck_name / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
-        # Let the strategy batch its lookups (e.g. one MPC search per deck).
-        self.strategy.prefetch(cards)
+        # Let each strategy batch its lookups (e.g. one MPC search per deck).
+        self._prefetch(cards)
         unique: dict[str, Path] = {}
         resolved: list[ResolvedCard] = []
         for index, card in enumerate(cards):
@@ -264,23 +280,82 @@ class Exporter:
         return written
 
     # ------------------------------------------------------------------
+    # Strategy selection (decks mixing games)
+    # ------------------------------------------------------------------
+    def _game_of(self, card: DeckCard) -> str | None:
+        """The card's own game, or ``None`` when the deck's strategy fetches it."""
+        if card.tcg is None or card.tcg == self.strategy.name:
+            return None
+        return card.tcg
+
+    def _strategy_for(self, tcg: str | None) -> TCGStrategy | None:
+        """Strategy of a game (``None`` = the deck's); ``None`` if unavailable."""
+        if tcg is None or tcg == self.strategy.name:
+            return self.strategy
+        if tcg not in self._strategies:
+            if self.strategy_factory is None:
+                logger.warning("No strategy available for game '%s'.", tcg)
+                return None
+            try:
+                self._strategies[tcg] = self.strategy_factory(tcg)
+            except ValueError as exc:
+                logger.warning("No strategy available for game '%s': %s", tcg, exc)
+                return None
+        return self._strategies[tcg]
+
+    def _prefetch(self, cards: list[DeckCard]) -> None:
+        """Let each strategy batch the lookups of its own cards.
+
+        ``[file:...]`` faces are hidden from the strategies (they never
+        fetch them).
+        """
+        by_game: dict[str | None, list[DeckCard]] = {}
+        for card in cards:
+            update = {}
+            if is_file_art(card.art):
+                update["art"] = None
+            if is_file_art(card.back_art):
+                update["back_art"] = None
+            by_game.setdefault(self._game_of(card), []).append(
+                card.model_copy(update=update) if update else card
+            )
+        for tcg, group in by_game.items():
+            strategy = self._strategy_for(tcg)
+            if strategy is not None:
+                strategy.prefetch(group)
+
+    # ------------------------------------------------------------------
     # De-duplicated downloads
     # ------------------------------------------------------------------
     def _fetch_single_image(
         self,
+        tcg: str | None,
         name: str,
         art: str | None,
         images_dir: Path,
         unique: dict[str, Path],
     ) -> Path | None:
-        """Fetch one face image (de-duplicated); ``None`` on failure."""
-        key = _image_key(name, art)
+        """Fetch one face image (de-duplicated); ``None`` on failure.
+
+        A ``[file:<name>]`` art is copied from the local images directory
+        (``local`` strategy), whatever the card's game.
+        """
+        own_file = is_file_art(art)
+        key = _image_key(name, art) if own_file else _game_key(tcg, name, art)
         if key in unique:
             return unique[key]
         image_path = images_dir / f"{key}.png"
         if not image_path.exists():
             logger.info("Fetching image for '%s'...", name)
-            ok = self.strategy.fetch_card_image(name, str(image_path), art=art)
+            if own_file:
+                strategy = self._strategy_for("local")
+                source_name, source_art = art[len(FILE_ART_PREFIX):], None
+            else:
+                strategy = self._strategy_for(tcg)
+                source_name, source_art = name, art
+            ok = strategy is not None and strategy.fetch_card_image(
+                source_name, str(image_path), art=source_art
+            )
             if not ok:
                 logger.warning("Failed to fetch image for '%s'", name)
                 if image_path.exists():
@@ -300,19 +375,26 @@ class Exporter:
         A failed front download leaves the entry without images (its back
         has no slot to align to); a failed back download degrades to a
         blank back slot. The returned card carries the pinned ``[art]``
-        markers (see :meth:`_pin_card`).
+        markers (see :meth:`_pin_card`). Both faces come from the card's
+        own strategy (``DeckCard.tcg``).
         """
-        card = self._pin_card(card)
-        front_path = self._fetch_single_image(card.name, card.art, images_dir, unique)
+        tcg = self._game_of(card)
+        strategy = self._strategy_for(tcg)
+        if strategy is None:
+            return ResolvedCard(card=card)
+        card = self._pin_card(card, strategy)
+        front_path = self._fetch_single_image(tcg, card.name, card.art, images_dir, unique)
         if front_path is None:
             return ResolvedCard(card=card)
         if card.front_only:
             return ResolvedCard(card=card, front_path=front_path)
         if not card.back_name:
-            back_path = self._fetch_automatic_back(card.name, card.art, images_dir, unique)
+            back_path = self._fetch_automatic_back(
+                strategy, tcg, card.name, _strategy_art(card.art), images_dir, unique
+            )
             return ResolvedCard(card=card, front_path=front_path, back_path=back_path)
         back_path = self._fetch_single_image(
-            card.back_name, card.back_art, images_dir, unique
+            tcg, card.back_name, card.back_art, images_dir, unique
         )
         if back_path is None:
             logger.warning(
@@ -323,28 +405,35 @@ class Exporter:
             )
         return ResolvedCard(card=card, front_path=front_path, back_path=back_path)
 
-    def _pin_card(self, card: DeckCard) -> DeckCard:
+    @staticmethod
+    def _pin_card(card: DeckCard, strategy: TCGStrategy) -> DeckCard:
         """Replace each face's ``[art]`` with the one pinned by the strategy.
 
         An automatic back the strategy can pin becomes an explicit
         ``/ Back [art]`` so the saved decklist reproduces it as well.
+        ``[file:...]`` arts are already exact and are kept as written.
         """
         update: dict[str, str | None] = {}
-        art = self.strategy.pin_art(card.name, card.art)
-        if art != card.art:
-            update["art"] = art
+        art = card.art
+        if not is_file_art(card.art):
+            art = strategy.pin_art(card.name, card.art)
+            if art != card.art:
+                update["art"] = art
         if card.back_name:
-            back_art = self.strategy.pin_art(card.back_name, card.back_art)
-            if back_art != card.back_art:
-                update["back_art"] = back_art
+            if not is_file_art(card.back_art):
+                back_art = strategy.pin_art(card.back_name, card.back_art)
+                if back_art != card.back_art:
+                    update["back_art"] = back_art
         elif not card.front_only:
-            back = self.strategy.pin_back(card.name, art)
+            back = strategy.pin_back(card.name, _strategy_art(art))
             if back is not None:
                 update["back_name"], update["back_art"] = back
         return card.model_copy(update=update) if update else card
 
+    @staticmethod
     def _fetch_automatic_back(
-        self,
+        strategy: TCGStrategy,
+        tcg: str | None,
         name: str,
         art: str | None,
         images_dir: Path,
@@ -355,12 +444,12 @@ class Exporter:
         Used only when the decklist line names no explicit back. The file
         is stored next to the front image under ``<front key>_back.png``.
         """
-        key = f"{_image_key(name, art)}_back"
+        key = f"{_game_key(tcg, name, art)}_back"
         if key in unique:
             return unique[key]
         image_path = images_dir / f"{key}.png"
         if not image_path.exists():
-            if not self.strategy.fetch_card_back_image(
+            if not strategy.fetch_card_back_image(
                 name, str(image_path), art=art
             ):
                 if image_path.exists():
@@ -745,3 +834,15 @@ def _image_key(name: str, art: str | None) -> str:
         art_slug = re.sub(r"[^\w]+", "-", art.replace("★", "star")).strip("-")
         key = f"{key}_{art_slug}"
     return key
+
+
+def _game_key(tcg: str | None, name: str, art: str | None) -> str:
+    """:func:`_image_key` of a face fetched by a game other than the deck's
+    (``tcg``), so e.g. a local 'Island' never reuses the MTG 'Island'."""
+    key = _image_key(name, art)
+    return f"{_sanitize_filename(tcg)}_{key}" if tcg else key
+
+
+def _strategy_art(art: str | None) -> str | None:
+    """``art`` as a strategy understands it (``[file:...]`` means its default)."""
+    return None if is_file_art(art) else art

@@ -219,3 +219,90 @@ def test_estimate_print_dpi_ignores_the_source_bleed(tmp_path, size, expected):
     Image.new("RGB", size).save(image)
 
     assert estimate_print_dpi(image) == expected
+
+
+def _mixed_exporter(tmp_path, default, others):
+    return Exporter(
+        default, str(tmp_path), target_dpi=LOW_DPI, strategy_factory=lambda tcg: others[tcg]
+    )
+
+
+def test_mixed_deck_uses_each_card_strategy(tmp_path):
+    mtg, lorcana = FakeStrategy(), FakeStrategy()
+    local = LocalStrategy(images_dir=str(IMAGES_DIR))
+    exporter = _mixed_exporter(tmp_path, mtg, {"lorcana": lorcana, "local": local})
+    cards = [
+        DeckCard(quantity=1, name="Island"),
+        DeckCard(quantity=1, name="Hades", tcg="lorcana"),
+        DeckCard(quantity=3, name="Pikachu", tcg="local"),
+    ]
+
+    resolved = exporter.resolve_images("deck", cards)
+    pdfs = exporter.render_pdfs("deck", resolved)
+
+    assert (mtg.calls, lorcana.calls) == (["Island"], ["Hades"])
+    assert all(r.front_path is not None for r in resolved)
+    assert resolved[2].front_path.name == "local_Pikachu.png"
+    assert [p.name for p in pdfs] == ["deck.pdf"]  # one sheet for every game
+    assert _page_count(pdfs[0]) == 1
+
+
+def test_same_name_in_two_games_gets_two_images(tmp_path):
+    exporter = _mixed_exporter(tmp_path, FakeStrategy(), {"lorcana": FakeStrategy()})
+    resolved = exporter.resolve_images("deck", [
+        DeckCard(quantity=1, name="Island"),
+        DeckCard(quantity=1, name="Island", tcg="lorcana"),
+    ])
+
+    assert resolved[0].front_path != resolved[1].front_path
+
+
+def test_unknown_game_fails_only_its_cards(tmp_path):
+    def factory(tcg):
+        raise ValueError(f"Unknown TCG strategy: {tcg}")
+
+    exporter = Exporter(FakeStrategy(), str(tmp_path), strategy_factory=factory)
+    resolved = exporter.resolve_images("deck", [
+        DeckCard(quantity=1, name="Island"),
+        DeckCard(quantity=1, name="Hades", tcg="nope"),
+    ])
+
+    assert resolved[0].front_path is not None
+    assert resolved[1].front_path is None
+
+
+def test_file_art_is_copied_from_the_local_images_for_any_game(tmp_path):
+    strategy = FakeStrategy(known=set())  # the deck's source finds nothing
+    exporter = _mixed_exporter(
+        tmp_path, strategy, {"local": LocalStrategy(images_dir=str(IMAGES_DIR))}
+    )
+    cards = [DeckCard(quantity=1, name="Bolt", art="file:Charizard.jpg", back_name="Shock", back_art="file:Pikachu.png")]
+
+    resolved = exporter.resolve_images("deck", cards)[0]
+
+    assert strategy.calls == []
+    assert resolved.front_path.read_bytes() == (IMAGES_DIR / "Charizard.jpg").read_bytes()
+    assert resolved.back_path.read_bytes() == (IMAGES_DIR / "Pikachu.png").read_bytes()
+    assert resolved.card.art == "file:Charizard.jpg"  # never re-pinned
+
+
+def test_file_art_front_keeps_the_automatic_back(tmp_path):
+    exporter = _mixed_exporter(
+        tmp_path, FakeStrategy(backs={"Delver"}), {"local": LocalStrategy(images_dir=str(IMAGES_DIR))}
+    )
+
+    resolved = exporter.resolve_images("deck", [DeckCard(quantity=1, name="Delver", art="file:Pikachu.png")])[0]
+
+    assert resolved.back_path is not None and resolved.back_path.name == "Delver_back.png"
+
+
+def test_saved_decklist_writes_game_sections(tmp_path):
+    exporter = _mixed_exporter(tmp_path, FakeStrategy(), {"lorcana": FakeStrategy()})
+    resolved = exporter.resolve_images("deck", [
+        DeckCard(quantity=1, name="Island"),
+        DeckCard(quantity=2, name="Hades", tcg="lorcana"),
+    ])
+
+    path = exporter.save_decklist("deck", resolved)
+
+    assert path.read_text(encoding="utf-8") == "[fake]\n1 Island\n[lorcana]\n2 Hades\n"

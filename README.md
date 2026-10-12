@@ -129,7 +129,30 @@ card between both and update the decklist.
   the strategy default (Lorcana: most premium art available; MTG: Scryfall's
   default printing), and only recognized art expressions are stripped, so
   bracketed text belonging to a card name is left untouched.
+- `[file:<file name>]` — prints your own image instead of the source's art,
+  for any game and on either face (`1 Lightning Bolt [file:my_bolt.png] /
+  Mountain`). The file is read from the local images directory
+  (`--local-dir`, default `input/images`). The web UI writes this marker
+  when you upload an image or paste its URL.
 - `*F*` / `*G*` — foil/premium marker (see [Output](#-output)).
+
+### 🎲 Mixing games in one deck
+
+A line with just `[mtg]`, `[lorcana]`, `[pokemon]` or `[local]` switches the
+game for the lines below it. Lines before any section use `--tcg` (or the
+game chosen in the web UI). Every card goes into the same PDFs, so you can
+fill whole sheets with cards from several games:
+
+```text
+1 Lightning Bolt
+[lorcana]
+1 Hades - King of Olympus [enchanted]
+[local]
+3 my_token.png
+```
+
+The saved decklist (`output/<tcg>/<deck>/<deck>.txt`) only writes these
+sections when the deck contains cards from a game other than the deck's own.
 
 **MTG example** (`input/mtg/sneaky.txt` with art picks):
 
@@ -199,8 +222,13 @@ before printing:
    request hundreds of MPC thumbnails at once, and caches them in memory
    and in `data/thumbnails` (`PROXYFORGE_CACHE_DIR`), so reopening a card
    is instant even after a restart. Only
-   the chosen art is downloaded. **✏️ Editar** changes name, copies or foil,
-   or removes the card. **✨ Pasar a foil / 🃏 Pasar a normales** moves a
+   the chosen art is downloaded. The picker also has **📤 Usar una imagen
+   propia**, available for every game: upload an image or paste a URL for
+   the front or the back. The image is saved, unchanged, in the local images
+   folder and written to the decklist as `[file:…]`. **✏️ Editar** changes
+   name, copies, foil or game, or removes the card.
+   **➕ Añadir cartas** appends cards to the deck being previewed, either
+   decklist lines of any game or a card made from your own image. **✨ Pasar a foil / 🃏 Pasar a normales** moves a
    card between the regular and foil PDFs in one click (or a whole tab at
    once with *Pasar todas a …*).
 5. **🖨️ Generar PDFs** renders the same PDFs as the CLI. Each tab then offers
@@ -235,8 +263,8 @@ quick test prints). Set `PROXYFORGE_OUTPUT_DIR` to change the default output fol
 | --- | --- | --- | --- |
 | `--input` | `-i` | _required_ | Path to the standard `.txt` deck file. |
 | `--output` | `-o` | `/app/output` | Base output directory. |
-| `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`, `local`). |
-| `--local-dir` | | `input/images` | Directory with local card images (Local only). Card names in the decklist must match the local file names. |
+| `--tcg` | `-t` | _required_ | TCG strategy to apply (`lorcana`, `pokemon`, `mtg`, `local`). Lines under a `[game]` section use that game instead ([mixing games](#-mixing-games-in-one-deck)). |
+| `--local-dir` | | `input/images` | Directory with local card images (`local` cards and `[file:…]` images of any game). Card names in the decklist must match the local file names. |
 | `--mpc-url` | | `https://mpcfill.com` | MPC Autofill backend URL (MTG `[mpc:<id>]` images and art picker). |
 | `--dpi` | | original | Resample every card to this DPI (e.g. `800`, `300` for drafts, high-quality JPEG). By default the PDF embeds the downloaded images as-is: JPEGs byte for byte, PNGs losslessly. |
 | `--verbose` | `-v` | off | Enable verbose logging. |
@@ -589,6 +617,9 @@ python -m pytest -k lorcana               # tests matching a keyword
 | `tests/test_mtg.py` | MPC Autofill `[mpc:<id>]` images and rate limits, Scryfall collector-number and named lookups, double-faced backs and Moxfield fallback |
 | `tests/test_pokemon.py` | pkmncards.com search, best-match selection and card-page fallback |
 | `tests/test_local.py` | Local image resolution (exact, case-insensitive, with extension, missing files) |
+| `tests/test_parser.py` | Decklist text parsing and formatting: markers, `[game]` sections, `[file:…]` images |
+| `tests/test_main.py` | CLI: mixed-game decks and unknown sections |
+| `tests/test_app.py` | Web UI (AppTest): preview tabs, art picker, own images, adding cards, mixed games |
 
 ---
 

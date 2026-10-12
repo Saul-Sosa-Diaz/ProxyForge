@@ -40,17 +40,22 @@ def _button(at: AppTest, label: str):
     return next(b for b in at.button if label in b.label)
 
 
-def _resolve_local_deck(tmp_path, text: str, strategy=None) -> AppTest:
+def _resolve_local_deck(
+    tmp_path, text: str, strategy=None, images_dir=IMAGES_DIR, lorcana=None
+) -> AppTest:
     at = AppTest.from_file(APP, default_timeout=TIMEOUT).run()
     at.sidebar.selectbox[0].set_value("local").run()
-    at.sidebar.text_input[0].set_value(str(IMAGES_DIR))
+    at.sidebar.text_input[0].set_value(str(images_dir))
     at.sidebar.text_input[1].set_value(str(tmp_path))
     at.sidebar.selectbox[1].set_value(300)
     at.text_area[0].input(text)
     at.text_input[0].input("preview")
     if strategy is not None:
         at.session_state["strategy"] = strategy
-        at.session_state["strategy_key"] = ("local", str(IMAGES_DIR))
+        at.session_state["strategy_key"] = ("local", str(images_dir))
+    if lorcana is not None:
+        # Serve the '[lorcana]' cards of the deck without network.
+        at.session_state["extra_strategies"] = {("lorcana", None): lorcana}
     at.run()
     _button(at, "Buscar imágenes").click().run()
     return at
@@ -381,3 +386,102 @@ def test_art_preview_sends_a_user_agent_and_skips_permanent_errors(monkeypatch):
     assert app._fetch_art_thumbnail("https://cards.scryfall.io/normal/x.jpg") is None
     assert len(calls) == 1  # 400 is not retried
     assert "python-requests" not in calls[0]["User-Agent"]
+
+
+def _own_images_dir(tmp_path) -> Path:
+    """Writable copy of the fixture images (own images are saved there)."""
+    import shutil
+
+    images = tmp_path / "images"
+    shutil.copytree(IMAGES_DIR, images)
+    return images
+
+
+def _serve_image(monkeypatch, image: Path) -> None:
+    import requests
+
+    monkeypatch.setattr(
+        requests, "get", lambda url, timeout, headers: _PreviewResponse(200, image.read_bytes())
+    )
+
+
+def test_mixed_decklist_sections_use_each_game(tmp_path):
+    lorcana = FakeStrategy()
+    at = _resolve_local_deck(tmp_path, "1 Pikachu\n[lorcana]\n2 Hades\n", lorcana=lorcana)
+
+    assert not at.exception
+    assert lorcana.calls == ["Hades"]
+    assert all(r.front_path is not None for r in at.session_state.resolved)
+    assert any("🎲 Disney Lorcana" in m.value for m in at.markdown)
+    written = tmp_path / "local" / "preview" / "preview.txt"
+    assert written.read_text(encoding="utf-8") == "[local]\n1 Pikachu\n[lorcana]\n2 Hades\n"
+
+
+def test_unknown_game_section_shows_error(tmp_path):
+    at = _resolve_local_deck(tmp_path, "1 Pikachu\n[yugioh]\n1 Kuriboh")
+
+    assert "resolved" not in at.session_state
+    assert any("yugioh" in e.value for e in at.error)
+
+
+def test_add_cards_of_another_game(tmp_path):
+    lorcana = FakeStrategy()
+    at = _resolve_local_deck(tmp_path, "1 Pikachu", lorcana=lorcana)
+
+    at.selectbox(key="add-game").set_value("lorcana")
+    next(t for t in at.text_area if t.label == "Líneas de decklist").input("2 Hades *F*")
+    _button(at, "➕ Añadir").click().run()
+
+    assert not at.exception
+    added = at.session_state.resolved[-1]
+    assert (added.card.name, added.card.tcg, added.card.foil) == ("Hades", "lorcana", True)
+    assert added.front_path is not None and lorcana.calls == ["Hades"]
+    assert _tab_labels(at) == ["🃏 Normales", "✨ Foil"]
+
+
+def test_add_card_with_an_own_image(tmp_path, monkeypatch):
+    images = _own_images_dir(tmp_path)
+    _serve_image(monkeypatch, CARD_BACK_PNG)
+    at = _resolve_local_deck(tmp_path, "1 Pikachu", images_dir=images)
+
+    next(t for t in at.text_input if t.label == "…o URL de la imagen").input("https://example.com/x.png")
+    next(t for t in at.text_input if t.label == "Nombre" and not t.value).input("Mi token")
+    [b for b in at.button if b.label == "➕ Añadir"][1].click().run()
+
+    assert not at.exception
+    card = at.session_state.resolved[-1]
+    assert card.card.name == "Mi token" and card.card.art.startswith("file:Mi token-")
+    assert card.front_path.read_bytes() == CARD_BACK_PNG.read_bytes()
+    assert (images / card.card.art.removeprefix("file:")).exists()
+
+
+def test_art_picker_accepts_an_own_image(tmp_path, monkeypatch):
+    images = _own_images_dir(tmp_path)
+    _serve_image(monkeypatch, CARD_BACK_PNG)
+    at = _resolve_local_deck(tmp_path, "1 Pikachu", images_dir=images)
+
+    _button(at, "Arte").click().run()  # local strategy: no source arts, only own images
+    at.text_input(key="custom-url-0").input("https://example.com/x.png").run()
+    _button(at, "Usar esta imagen").click().run()
+
+    assert not at.exception
+    item = at.session_state.resolved[0]
+    assert item.card.name == "Pikachu" and item.card.art.startswith("file:Pikachu-")
+    assert item.front_path.read_bytes() == CARD_BACK_PNG.read_bytes()
+    assert any("imagen propia" in m.value for m in at.markdown)
+
+
+def test_edit_moves_a_card_to_another_game(tmp_path):
+    lorcana = FakeStrategy()
+    at = _resolve_local_deck(tmp_path, "1 Pikachu\n1 Hades", lorcana=lorcana)
+    assert at.session_state.resolved[1].front_path is None  # not a local image
+    at = _open_tab(at, FAILED_TAB)
+
+    at.selectbox(key="edit-game-1").set_value("lorcana")
+    [b for b in at.button if b.label == "Aplicar"][-1].click()  # Hades: only card shown
+    at.session_state["preview-tab"] = FAILED_TAB  # AppTest would resend the old tab
+    at.run()
+
+    assert not at.exception
+    item = at.session_state.resolved[1]
+    assert item.card.tcg == "lorcana" and item.front_path is not None
