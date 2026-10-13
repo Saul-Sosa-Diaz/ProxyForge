@@ -306,3 +306,14 @@ def test_saved_decklist_writes_game_sections(tmp_path):
     path = exporter.save_decklist("deck", resolved)
 
     assert path.read_text(encoding="utf-8") == "[fake]\n1 Island\n[lorcana]\n2 Hades\n"
+
+
+def test_long_image_keys_are_shortened_with_a_hash():
+    from src.exporter import MAX_IMAGE_KEY_LENGTH, _image_key
+
+    name = "httpssteamusercontentaakamaihdnetugc2479868001961048427F0DCAA6991EDED8763 1"
+    key = _image_key(name, "file:" + "x" * 70 + "-0123456789.png")
+
+    assert len(key) == MAX_IMAGE_KEY_LENGTH and key.startswith("httpssteam")
+    assert key != _image_key(name.replace(" 1", " 2"), "file:" + "x" * 70 + "-0123456789.png")
+    assert _image_key("Lightning Bolt", "m21") == "Lightning_Bolt_m21"

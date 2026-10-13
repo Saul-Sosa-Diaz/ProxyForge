@@ -669,7 +669,17 @@ def _render_deck_input(ctx: _Context) -> None:
         default_name = DEFAULT_DECK_NAME
     deck_name = _clean_deck_name(st.text_input("Nombre del mazo", default_name))
 
-    if not st.button("🔍 Buscar imágenes", type="primary", disabled=not text.strip()):
+    search_col, empty_col = st.columns(2)
+    if empty_col.button(
+        "➕ Empezar sin decklist",
+        help="Crea un mazo vacío para añadir las cartas a mano: por nombre o con imágenes propias.",
+        width="stretch",
+    ):
+        _start_empty_deck(ctx, deck_name)
+        return
+    if not search_col.button(
+        "🔍 Buscar imágenes", type="primary", disabled=not text.strip(), width="stretch"
+    ):
         return
     try:
         cards = parse_deck_text(text)
@@ -698,6 +708,14 @@ def _render_deck_input(ctx: _Context) -> None:
     st.session_state.update(
         resolved=resolved, deck_name=deck_name, context=ctx, pdfs=[], deck_text=text
     )
+    _close_art_dialog()
+
+
+def _start_empty_deck(ctx: _Context, deck_name: str) -> None:
+    """Open an empty preview, with «➕ Añadir cartas» unfolded to fill it."""
+    st.session_state.update(resolved=[], deck_name=deck_name, context=ctx, pdfs=[], deck_text="")
+    # Expander state (not its 'expanded' argument, which is part of its identity).
+    st.session_state["add-cards-expander"] = True
     _close_art_dialog()
 
 
@@ -1116,7 +1134,10 @@ def _render_preview(
     metrics[3].metric("No encontradas", len(failed))
 
     _render_pdf_actions(dpi, foil_tone, has_cards=bool(found))
-    _render_decklist(resolved, ctx, deck_name)
+    if resolved:
+        _render_decklist(resolved, ctx, deck_name)
+    else:
+        st.info("Mazo vacío: añade cartas por nombre o con imágenes propias en «➕ Añadir cartas».")
     _render_add_cards(ctx, deck_name)
 
     groups = [
@@ -1176,7 +1197,8 @@ def _game_selectbox(label: str, value: str, key: str) -> str:
 
 def _render_add_cards(ctx: _Context, deck_name: str) -> None:
     """Append cards of any game (or with an own image) to the current deck."""
-    with st.expander("➕ Añadir cartas"):
+    # Keyed and tracked so it stays open after adding (which reruns the app).
+    with st.expander("➕ Añadir cartas", key="add-cards-expander", on_change="rerun"):
         by_name, by_image = st.columns(2)
         with by_name, st.form("add-cards", clear_on_submit=True):
             st.markdown("**Por nombre, de cualquier juego**")

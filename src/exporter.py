@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections.abc import Callable, Iterable
@@ -33,6 +34,9 @@ _BLEED_OVERLAP_PT = 0.5
 # Bleed per side (mm) accepted as part of a downloaded image (MPC Autofill
 # print files carry ~3 mm); anything else is treated as a plain card scan.
 SOURCE_BLEED_RANGE_MM = (1.0, 6.0)
+# Longest image file stem: long names plus '[file:...]' arts overflow the
+# 260-character path limit of Windows. Longer keys keep a prefix and a hash.
+MAX_IMAGE_KEY_LENGTH = 100
 
 # Professional cut geometry: gutter between cards, mirrored-edge bleed and
 # trim (crop) marks placed in the outer margins of the sheet.
@@ -845,6 +849,9 @@ def _image_key(name: str, art: str | None) -> str:
         # '★' marks a distinct MTG printing (sld:1512★ vs sld:1512).
         art_slug = re.sub(r"[^\w]+", "-", art.replace("★", "star")).strip("-")
         key = f"{key}_{art_slug}"
+    if len(key) > MAX_IMAGE_KEY_LENGTH:
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+        key = f"{key[:MAX_IMAGE_KEY_LENGTH - len(digest) - 1]}_{digest}"
     return key
 
 

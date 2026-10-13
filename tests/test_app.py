@@ -620,3 +620,43 @@ def test_split_sheet_into_own_cards(tmp_path, monkeypatch):
     ]
     # The inputs are cleared for the next sheet.
     assert at.text_input(key="sheet-url-1").value == ""
+
+
+def test_own_images_with_long_names_are_found(tmp_path, monkeypatch):
+    images = _own_images_dir(tmp_path)
+    _serve_image(monkeypatch, _sheet_png(tmp_path / "sheet.png", rows=1, cols=2))
+    at = _resolve_local_deck(tmp_path, "1 Pikachu", images_dir=images)
+
+    # Long names plus the '[file:...]' art used to overflow Windows paths.
+    long_name = "httpssteamusercontentaakamaihdnetugc2479868001961048427F0DCAA6991EDED8763130749"
+    at.text_input(key="sheet-url-0").input("https://example.com/hoja.png")
+    at.text_input(key="sheet-name-0").input(long_name)
+    at.number_input(key="sheet-rows").set_value(1)
+    at.number_input(key="sheet-cols").set_value(2).run()
+    at.button(key="sheet-add").click().run()
+
+    assert not at.exception
+    assert all(r.front_path is not None for r in at.session_state.resolved)
+    assert len(at.session_state.resolved) == 3
+
+
+def test_start_without_decklist_and_add_cards(tmp_path):
+    at = AppTest.from_file(APP, default_timeout=TIMEOUT).run()
+    at.sidebar.selectbox[0].set_value("local").run()
+    at.sidebar.text_input[0].set_value(str(IMAGES_DIR))
+    at.sidebar.text_input[1].set_value(str(tmp_path))
+    at.text_input[0].input("a mano").run()
+    _button(at, "Empezar sin decklist").click().run()
+
+    assert not at.exception and at.session_state.resolved == []
+    assert at.session_state["add-cards-expander"]
+    assert any("Mazo vacío" in i.value for i in at.info)
+
+    next(t for t in at.text_area if t.label == "Líneas de decklist").input("2 Pikachu")
+    _button(at, "➕ Añadir").click().run()
+
+    assert not at.exception
+    [added] = at.session_state.resolved
+    assert (added.card.name, added.card.quantity) == ("Pikachu", 2) and added.front_path
+    written = tmp_path / "local" / "a mano" / "a mano.txt"
+    assert written.read_text(encoding="utf-8") == "2 Pikachu\n"
