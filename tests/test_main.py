@@ -27,3 +27,15 @@ def test_section_games_are_fetched_by_their_strategy(tmp_path):
 
 def test_unknown_section_is_a_deck_error(tmp_path):
     assert _run(tmp_path, "1 Pikachu\n[yugioh]\n1 Kuriboh\n") == 2
+
+
+def test_foil_tone_options():
+    from src.main import _build_parser, _foil_tone
+    from src.pdf import ToneAdjustment
+
+    def tone(*extra):
+        return _foil_tone(_build_parser().parse_args(["--input", "d.txt", "--tcg", "local", *extra]))
+
+    assert tone() is None
+    assert tone("--foil-lighten") == ToneAdjustment()
+    assert tone("--foil-exposure", "20") == ToneAdjustment(exposure=0.20)

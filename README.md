@@ -267,6 +267,8 @@ quick test prints). Set `PROXYFORGE_OUTPUT_DIR` to change the default output fol
 | `--local-dir` | | `input/images` | Directory with local card images (`local` cards and `[file:…]` images of any game). Card names in the decklist must match the local file names. |
 | `--mpc-url` | | `https://mpcfill.com` | MPC Autofill backend URL (MTG `[mpc:<id>]` images and art picker). |
 | `--dpi` | | original | Resample every card to this DPI (e.g. `800`, `300` for drafts, high-quality JPEG). By default the PDF embeds the downloaded images as-is: JPEGs byte for byte, PNGs losslessly. |
+| `--foil-lighten` | | off | Lighten the images of the foil PDFs so the foil shows through ([foil lightening](#-lightening-foil-prints)). |
+| `--foil-exposure` / `--foil-shadows` / `--foil-opacity` | | `15` / `10` / `93` | Tune the foil lightening, in % (any of them turns it on). |
 | `--verbose` | `-v` | off | Enable verbose logging. |
 
 ---
@@ -291,6 +293,26 @@ Decklist entries marked as foil/premium with a trailing `*F*` (Manabox) or
 be printed on separate (e.g. holographic) paper stock; the marker is
 stripped from the card name before fetching. Decks without foil entries
 only produce the regular PDF.
+
+### ✨ Lightening foil prints
+
+Ink printed on foil / holographic stock looks darker than on screen and
+dark areas hide the foil. `--foil-lighten` (web: **✨ Aclarar foils** in the
+sidebar) "burns" the images of every foil PDF on purpose — on screen they
+look slightly washed out so they print right on foil. Regular PDFs are
+never touched. Three steps, applied in order:
+
+1. **Exposure / brightness** (`--foil-exposure`, default +15 %; 10–20 % recommended).
+2. **Shadow lift** like Levels / Curves (`--foil-shadows`, default 10 %:
+   black becomes a 10 % grey, fading out towards the midtones) so dark
+   greys and browns don't turn into solid black.
+3. **Opacity** over white (`--foil-opacity`, default 93 %; 90–95 % recommended).
+
+Adjusted images are re-encoded losslessly (PNG), or as JPEG with `--dpi`.
+
+```bash
+python src/main.py -i input/mtg/deck.txt -t mtg --foil-lighten --foil-exposure 20
+```
 
 Double-sided entries (`/ Back Name`) are separated into their own pair of
 PDFs — `front_<deck>.pdf` (fronts, deck order) plus

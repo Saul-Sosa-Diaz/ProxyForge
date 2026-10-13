@@ -12,7 +12,7 @@ from PIL import Image
 
 from .models import DeckCard, ResolvedCard
 from .parser import FILE_ART_PREFIX, format_deck, is_file_art
-from .pdf import PdfWriter, draw_image_ops, line_ops
+from .pdf import PdfWriter, ToneAdjustment, draw_image_ops, line_ops
 from .strategies.base import TCGStrategy
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,7 @@ class Exporter:
         card_gap_mm: float = CARD_GAP_MM,
         target_dpi: int | None = None,
         strategy_factory: Callable[[str], TCGStrategy] | None = None,
+        foil_tone: ToneAdjustment | None = None,
     ) -> None:
         """Configure the exporter.
 
@@ -95,6 +96,9 @@ class Exporter:
                 asks for (``[mtg]`` / ``[lorcana]`` ... decklist sections, and
                 ``local`` for ``[file:...]`` arts); each is built once. May
                 raise ``ValueError`` for unknown games: those cards then fail.
+            foil_tone: Tone curve applied to every image of the foil PDFs
+                (lighter so the foil shows through); ``None`` keeps them as
+                downloaded. Regular PDFs are never adjusted.
         """
         self.strategy = strategy
         self.strategy_factory = strategy_factory
@@ -105,6 +109,7 @@ class Exporter:
         self.page_margin_mm = page_margin_mm
         self.card_gap_mm = card_gap_mm
         self.target_dpi = target_dpi
+        self.foil_tone = foil_tone
 
     # ------------------------------------------------------------------
     # Public API
@@ -200,7 +205,8 @@ class Exporter:
         front grid — same 63x88 mm slots, same gutter, same margins, same
         upright orientation — with columns mirrored so manual duplex
         ("flip on long edge", print at 100 %) aligns each back with its
-        front. Grouping always follows the front-face foil flag.
+        front. Grouping always follows the front-face foil flag. Every
+        foil PDF (backs included, they share the stock) gets ``foil_tone``.
 
         Args:
             deck_name: Deck name; selects the output subfolder and PDF names.
@@ -229,9 +235,10 @@ class Exporter:
                 continue
             singles = [(f, q) for f, b, q in group if b is None]
             duals = [(f, b, q) for f, b, q in group if b is not None]
+            tone = self.foil_tone if foil else None
             if singles:
                 pdf_path = deck_dir / f"{prefix}{deck_name}.pdf"
-                self._build_pdf(singles, pdf_path)
+                self._build_pdf(singles, pdf_path, tone)
                 logger.info("%s written to %s", tag, pdf_path)
                 pdf_paths.append(pdf_path)
             pdf_paths.extend(self._emit_dual_pdfs(deck_dir, deck_name, duals, foil=foil))
@@ -268,13 +275,14 @@ class Exporter:
                 deck_name,
             )
             return []
+        tone = self.foil_tone if foil else None
         dual_front_pdf = deck_dir / f"{prefix}{deck_name}.pdf"
-        self._build_front_pages(front_flat, dual_front_pdf)
+        self._build_front_pages(front_flat, dual_front_pdf, tone)
         logger.info("%s front PDF written to %s", tag, dual_front_pdf)
         written = [dual_front_pdf]
         if any(b is not None for b in back_flat):
             dual_back_pdf = deck_dir / f"{back_prefix}{deck_name}.pdf"
-            self._build_back_pages(back_flat, dual_back_pdf)
+            self._build_back_pages(back_flat, dual_back_pdf, tone)
             logger.info("%s back PDF written to %s", tag, dual_back_pdf)
             written.append(dual_back_pdf)
         return written
@@ -554,6 +562,7 @@ class Exporter:
         self,
         expanded: list[tuple[Path, int]],
         pdf_path: Path,
+        tone: ToneAdjustment | None = None,
     ) -> None:
         """Legacy front-only builder (kept for backwards compatibility)."""
         slots = self._flatten_slots(expanded)
@@ -562,12 +571,13 @@ class Exporter:
         valid_slots = [s for s in slots if s.exists()]
         if not valid_slots:
             raise RuntimeError("No downloaded images exist on disk.")
-        self._build_front_pages(valid_slots, pdf_path)
+        self._build_front_pages(valid_slots, pdf_path, tone)
 
     def _build_front_pages(
         self,
         front_slots: list[Path],
         pdf_path: Path,
+        tone: ToneAdjustment | None = None,
     ) -> None:
         """Render front pages in natural order (no mirroring)."""
         if not front_slots:
@@ -581,7 +591,7 @@ class Exporter:
             for idx, slot_path in enumerate(page_slots):
                 col = idx % geo.cols
                 row = idx // geo.cols
-                ops.append(self._card_ops(writer, geo, slot_path, col, row))
+                ops.append(self._card_ops(writer, geo, slot_path, col, row, tone))
             # Trim (crop) marks in the outer margins, one tick per card edge.
             ops.append(self._crop_mark_ops(geo))
             writer.add_page(geo.page_w, geo.page_h, "\n".join(ops))
@@ -591,6 +601,7 @@ class Exporter:
         self,
         back_slots: list[Path | None],
         pdf_path: Path,
+        tone: ToneAdjustment | None = None,
     ) -> None:
         """Render back pages mirrored for manual duplex (flip on long edge).
 
@@ -632,7 +643,7 @@ class Exporter:
                 col = idx % geo.cols
                 row = idx // geo.cols
                 mirror_col = (geo.cols - 1) - col
-                ops.append(self._card_ops(writer, geo, slot_path, mirror_col, row))
+                ops.append(self._card_ops(writer, geo, slot_path, mirror_col, row, tone))
             ops.append(self._crop_mark_ops(geo))
             writer.add_page(geo.page_w, geo.page_h, "\n".join(ops))
         writer.save(pdf_path)
@@ -665,6 +676,7 @@ class Exporter:
         slot_path: Path,
         col: int,
         row: int,
+        tone: ToneAdjustment | None = None,
     ) -> str:
         """Operators placing one card in grid slot ``(col, row)`` with bleed.
 
@@ -679,7 +691,7 @@ class Exporter:
         card edge.
         """
         source_bleed_mm = _source_bleed_mm(slot_path)
-        name = writer.add_image(slot_path, self._image_size(source_bleed_mm))
+        name = writer.add_image(slot_path, self._image_size(source_bleed_mm), tone)
         w, h, b = geo.card_w, geo.card_h, geo.bleed
         s = _mm_to_pt(source_bleed_mm)
         x = geo.start_x + col * (w + geo.gap)

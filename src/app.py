@@ -28,11 +28,12 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
+from urllib.parse import unquote, urlparse
 
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 # Bootstrap the project root onto sys.path so the ``src`` package is importable
 # when Streamlit runs this file as a script.
@@ -43,6 +44,7 @@ from src.exporter import PRINT_DPI, Exporter, estimate_print_dpi
 from src.main import _STRATEGY_REGISTRY, _make_strategy
 from src.models import ArtOption, DeckCard, ResolvedCard
 from src.parser import FILE_ART_PREFIX, format_deck, is_file_art, parse_deck_text
+from src.pdf import MAX_SHADOW_LIFT, ToneAdjustment
 from src.strategies.base import TCGStrategy
 from src.strategies.local import LocalStrategy
 
@@ -79,6 +81,9 @@ ART_THUMBNAIL_HEADERS = {"User-Agent": "tgc-card-image-downloader/1.0", "Accept"
 # Own images ('[file:...]' arts) kept as uploaded; anything else becomes PNG.
 CUSTOM_IMAGE_EXTENSIONS = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
 CUSTOM_IMAGE_TYPES = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"]
+# Sheet splitter: largest grid offered and width (px) of its preview.
+SHEET_MAX_CELLS_PER_SIDE = 20
+SHEET_PREVIEW_WIDTH = 900
 
 TCG_LABELS = {
     "local": "Imágenes locales",
@@ -302,11 +307,14 @@ def _get_strategy(ctx: _Context, tcg: str | None = None) -> TCGStrategy:
     return st.session_state.strategy
 
 
-def _get_exporter(ctx: _Context, dpi: int | None = None) -> Exporter:
+def _get_exporter(
+    ctx: _Context, dpi: int | None = None, foil_tone: ToneAdjustment | None = None
+) -> Exporter:
     return Exporter(
         strategy=_get_strategy(ctx),
         output_base_dir=str(Path(ctx.output_dir) / ctx.tcg),
         target_dpi=dpi,
+        foil_tone=foil_tone,
         strategy_factory=lambda tcg: _get_strategy(ctx, tcg),
     )
 
@@ -413,6 +421,153 @@ def _custom_image_data(uploaded, url: str) -> bytes:
     return _download_custom_image(url.strip())
 
 
+def _custom_image_sources(uploaded: list, urls: str) -> list[tuple[str, Callable[[], bytes]]]:
+    """Own images to add: uploaded files first, then one URL per line.
+
+    Returns:
+        ``(default card name, loader of the image bytes)`` pairs; the loader
+        raises ``ValueError`` if a URL cannot be downloaded.
+    """
+    sources: list[tuple[str, Callable[[], bytes]]] = [
+        (Path(file.name).stem, file.getvalue) for file in uploaded
+    ]
+    for url in filter(None, (line.strip() for line in urls.splitlines())):
+        stem = Path(unquote(urlparse(url).path)).stem or "Carta propia"
+        sources.append((stem, functools.partial(_download_custom_image, url)))
+    return sources
+
+
+def _custom_card(
+    data: bytes, card_name: str, quantity: int, foil: bool, ctx: _Context
+) -> DeckCard:
+    """Deck line for an own image, saved in the local images folder.
+
+    Raises:
+        ValueError: If the name is not a valid card name or ``data`` is not an image.
+    """
+    # Validates the name ('/' would split it into two faces).
+    parsed = parse_deck_text(f"{quantity} {card_name}")[0]
+    file_name = _save_custom_image(data, parsed.name, ctx.local_dir)
+    # 'local': no strategy should look the name up (e.g. an MTG back).
+    return parsed.model_copy(
+        update={
+            "art": f"{FILE_ART_PREFIX}{file_name}",
+            "foil": foil,
+            "back_name": None,
+            "front_only": False,
+            "tcg": _own_game("local", ctx),
+        }
+    )
+
+
+def _open_sheet(data: bytes) -> Image.Image:
+    """Decode a sheet of cards as RGB(A).
+
+    Raises:
+        ValueError: If ``data`` is not an image.
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.load()
+            alpha = "A" in img.getbands() or "transparency" in img.info
+            return img.convert("RGBA" if alpha else "RGB")
+    except (OSError, ValueError) as exc:
+        raise ValueError("El fichero no es una imagen válida.") from exc
+
+
+def _sheet_cells(
+    size: tuple[int, int], rows: int, cols: int, margin: int = 0, gap: int = 0
+) -> list[tuple[int, int, int, int]]:
+    """Boxes of a ``rows`` x ``cols`` grid, left to right and top to bottom.
+
+    Args:
+        size: Sheet ``(width, height)`` in pixels.
+        rows: Number of rows.
+        cols: Number of columns.
+        margin: Outer border (px) cut away on every side.
+        gap: Space (px) between neighbouring cards, cut away too.
+
+    Returns:
+        ``(left, top, right, bottom)`` boxes in pixels.
+
+    Raises:
+        ValueError: If the margin and gaps leave no room for the cards.
+    """
+    width, height = size
+    cell_w = (width - 2 * margin - (cols - 1) * gap) / cols
+    cell_h = (height - 2 * margin - (rows - 1) * gap) / rows
+    if cell_w < 1 or cell_h < 1:
+        raise ValueError("El margen y la separación no dejan sitio para las cartas.")
+    boxes = []
+    for row in range(rows):
+        top = margin + row * (cell_h + gap)
+        for col in range(cols):
+            left = margin + col * (cell_w + gap)
+            boxes.append((round(left), round(top), round(left + cell_w), round(top + cell_h)))
+    return boxes
+
+
+def _split_sheet(
+    data: bytes, rows: int, cols: int, margin: int = 0, gap: int = 0
+) -> list[bytes]:
+    """Cut a sheet of cards into one PNG (lossless) per grid cell.
+
+    Returns:
+        The card images, left to right and top to bottom.
+
+    Raises:
+        ValueError: If ``data`` is not an image or the grid does not fit.
+    """
+    sheet = _open_sheet(data)
+    cells = []
+    for box in _sheet_cells(sheet.size, rows, cols, margin, gap):
+        buffer = io.BytesIO()
+        sheet.crop(box).save(buffer, "PNG")
+        cells.append(buffer.getvalue())
+    return cells
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _sheet_preview(
+    data: bytes, rows: int, cols: int, margin: int, gap: int, skipped: tuple[int, ...]
+) -> bytes:
+    """Downscaled sheet with the cut grid drawn on it and each cell numbered.
+
+    Discarded cells (1-based numbers in ``skipped``) are greyed out.
+    """
+    sheet = _open_sheet(data).convert("RGB")
+    boxes = _sheet_cells(sheet.size, rows, cols, margin, gap)
+    scale = min(1.0, SHEET_PREVIEW_WIDTH / sheet.width)
+    sheet = sheet.resize((max(1, round(sheet.width * scale)), max(1, round(sheet.height * scale))))
+    overlay = Image.new("RGBA", sheet.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    cell_px = min(boxes[0][2] - boxes[0][0], boxes[0][3] - boxes[0][1]) * scale
+    font = ImageFont.load_default(size=max(12, min(32, round(cell_px / 5))))
+    for number, box in enumerate(boxes, start=1):
+        left, top, right, bottom = (round(v * scale) for v in box)
+        if number in skipped:
+            draw.rectangle((left, top, right, bottom), fill=(40, 40, 40, 170))
+        draw.rectangle((left, top, right, bottom), outline=(255, 64, 64, 255), width=2)
+        label = str(number)
+        text_box = draw.textbbox((left + 6, top + 4), label, font=font)
+        draw.rectangle(
+            (text_box[0] - 4, text_box[1] - 2, text_box[2] + 4, text_box[3] + 2),
+            fill=(0, 0, 0, 190),
+        )
+        draw.text((left + 6, top + 4), label, fill=(255, 255, 255, 255), font=font)
+    buffer = io.BytesIO()
+    Image.alpha_composite(sheet.convert("RGBA"), overlay).convert("RGB").save(
+        buffer, "JPEG", quality=85
+    )
+    return buffer.getvalue()
+
+
+@st.cache_data(show_spinner=False, max_entries=4, ttl=3600)
+def _download_sheet(url: str) -> bytes:
+    """Sheet image at ``url``, cached so the live preview downloads it once."""
+    return _download_custom_image(url)
+
+
 def _replace_card(index: int, item: ResolvedCard) -> None:
     st.session_state.resolved[index] = item
     st.session_state.pdfs = []
@@ -429,7 +584,7 @@ def _zip_files(paths: list[Path]) -> bytes:
 # --- Page sections ---------------------------------------------------------
 
 
-def _render_sidebar() -> tuple[_Context, int | None]:
+def _render_sidebar() -> tuple[_Context, int | None, ToneAdjustment | None]:
     with st.sidebar:
         st.header("Ajustes")
         tcg = st.selectbox(
@@ -456,7 +611,38 @@ def _render_sidebar() -> tuple[_Context, int | None]:
                 "un DPI fijo genera PDFs más ligeros (300 para borradores)."
             ),
         )
-    return _Context(tcg=tcg, local_dir=local_dir, output_dir=output_dir), dpi
+        foil_tone = _render_foil_tone()
+    return _Context(tcg=tcg, local_dir=local_dir, output_dir=output_dir), dpi, foil_tone
+
+
+def _render_foil_tone() -> ToneAdjustment | None:
+    """Sidebar controls of the foil lightening (``None`` = images as downloaded)."""
+    enabled = st.checkbox(
+        "✨ Aclarar foils",
+        help=(
+            "Solo en los PDFs foil: la tinta sobre foil sale más oscura y tapa el brillo, "
+            "así que la imagen se «quema» a propósito (en pantalla se verá lavada)."
+        ),
+    )
+    if not enabled:
+        return None
+    defaults = ToneAdjustment()
+    exposure = st.slider(
+        "Exposición / brillo (+%)", 0, 30, round(defaults.exposure * 100),
+        help="Sube la exposición general; se recomienda entre +10 % y +20 %.",
+    )
+    shadows = st.slider(
+        "Levantar sombras (%)", 0, round(MAX_SHADOW_LIFT * 100), round(defaults.shadows * 100),
+        help=(
+            "Como en Niveles/Curvas: el negro pasa a este gris y los tonos oscuros suben, "
+            "para que grises oscuros y marrones no se conviertan en negro sólido."
+        ),
+    )
+    opacity = st.slider(
+        "Opacidad (%)", 80, 100, round(defaults.opacity * 100),
+        help="Opacidad de la imagen sobre el blanco; entre 90 % y 95 % aclara los tonos generales.",
+    )
+    return ToneAdjustment(exposure=exposure / 100, shadows=shadows / 100, opacity=opacity / 100)
 
 
 def _render_deck_input(ctx: _Context) -> None:
@@ -907,7 +1093,9 @@ def _render_card_grid(
                 _render_card(index, item, ctx, deck_name, pair_number)
 
 
-def _render_preview(current: _Context, dpi: int | None) -> None:
+def _render_preview(
+    current: _Context, dpi: int | None, foil_tone: ToneAdjustment | None = None
+) -> None:
     resolved: list[ResolvedCard] = st.session_state.resolved
     ctx: _Context = st.session_state.context
     deck_name: str = st.session_state.deck_name
@@ -927,7 +1115,7 @@ def _render_preview(current: _Context, dpi: int | None) -> None:
     metrics[2].metric("Dos caras", sum(1 for r in found if r.back_path is not None))
     metrics[3].metric("No encontradas", len(failed))
 
-    _render_pdf_actions(dpi, has_cards=bool(found))
+    _render_pdf_actions(dpi, foil_tone, has_cards=bool(found))
     _render_decklist(resolved, ctx, deck_name)
     _render_add_cards(ctx, deck_name)
 
@@ -1007,41 +1195,122 @@ def _render_add_cards(ctx: _Context, deck_name: str) -> None:
                 if cards and _check_games(cards):
                     _add_cards(ctx, deck_name, cards)
         with by_image, st.form("add-custom-card", clear_on_submit=True):
-            st.markdown("**Con una imagen propia**")
-            uploaded = st.file_uploader("Imagen", type=CUSTOM_IMAGE_TYPES)
-            url = st.text_input("…o URL de la imagen")
-            name = st.text_input("Nombre", placeholder="Por defecto, el del fichero")
-            quantity = st.number_input("Copias", min_value=1, value=1, step=1)
+            st.markdown("**Con imágenes propias**")
+            uploaded = st.file_uploader(
+                "Imágenes", type=CUSTOM_IMAGE_TYPES, accept_multiple_files=True
+            )
+            urls = st.text_area("…o URLs de las imágenes (una por línea)")
+            name = st.text_input(
+                "Nombre", placeholder="Por defecto, el del fichero", help="Solo con una imagen."
+            )
+            quantity = st.number_input("Copias de cada una", min_value=1, value=1, step=1)
             foil = st.checkbox("Foil")
             if st.form_submit_button("➕ Añadir", type="primary"):
-                if uploaded is None and not url.strip():
-                    st.error("Sube una imagen o pega su URL.")
+                sources = _custom_image_sources(uploaded or [], urls)
+                if not sources:
+                    st.error("Sube una o más imágenes o pega sus URLs.")
                     return
-                default_name = Path(uploaded.name).stem if uploaded is not None else "Carta propia"
-                card_name = name.strip() or default_name
-                try:
-                    # Validates the name ('/' would split it into two faces).
-                    parsed = parse_deck_text(f"{int(quantity)} {card_name}")[0]
-                    file_name = _save_custom_image(
-                        _custom_image_data(uploaded, url), parsed.name, ctx.local_dir
-                    )
-                except ValueError as exc:
-                    st.error(str(exc))
+                if name.strip() and len(sources) > 1:
+                    st.error("El nombre solo se puede fijar al añadir una única imagen.")
                     return
-                # 'local': no strategy should look the name up (e.g. an MTG back).
-                card = parsed.model_copy(
-                    update={
-                        "art": f"{FILE_ART_PREFIX}{file_name}",
-                        "foil": foil,
-                        "back_name": None,
-                        "front_only": False,
-                        "tcg": _own_game("local", ctx),
-                    }
-                )
-                _add_cards(ctx, deck_name, [card])
+                cards, skipped = [], []
+                for default_name, load in sources:
+                    card_name = name.strip() or default_name
+                    try:
+                        cards.append(_custom_card(load(), card_name, int(quantity), foil, ctx))
+                    except ValueError as exc:
+                        skipped.append(f"{default_name}: {exc}")
+                if not cards:
+                    st.error("\n\n".join(skipped))
+                    return
+                _add_cards(ctx, deck_name, cards, skipped)
+        st.divider()
+        _render_sheet_splitter(ctx, deck_name)
 
 
-def _add_cards(ctx: _Context, deck_name: str, cards: list[DeckCard]) -> None:
+def _render_sheet_splitter(ctx: _Context, deck_name: str) -> None:
+    """Cut a sheet with several cards into one own image per grid cell.
+
+    Not a form: the preview redraws the grid as rows, columns, margin and
+    gap change. The widget keys carry a counter that is bumped after adding,
+    which clears the inputs.
+    """
+    st.markdown("**✂️ Dividir una hoja con varias cartas**")
+    form = st.session_state.get("sheet_form", 0)
+    settings, preview = st.columns([1, 2])
+    with settings:
+        uploaded = st.file_uploader("Hoja de cartas", type=CUSTOM_IMAGE_TYPES, key=f"sheet-file-{form}")
+        url = st.text_input("…o URL de la hoja", key=f"sheet-url-{form}").strip()
+        rows_col, cols_col = st.columns(2)
+        rows = int(rows_col.number_input(
+            "Filas", min_value=1, max_value=SHEET_MAX_CELLS_PER_SIDE, value=3, key="sheet-rows"
+        ))
+        cols = int(cols_col.number_input(
+            "Columnas", min_value=1, max_value=SHEET_MAX_CELLS_PER_SIDE, value=3, key="sheet-cols"
+        ))
+        margin_col, gap_col = st.columns(2)
+        margin = int(margin_col.number_input(
+            "Margen (px)", min_value=0, value=0, key="sheet-margin",
+            help="Borde exterior de la hoja que se descarta.",
+        ))
+        gap = int(gap_col.number_input(
+            "Separación (px)", min_value=0, value=0, key="sheet-gap",
+            help="Espacio entre cartas vecinas que se descarta.",
+        ))
+        skipped_cells = st.multiselect(
+            "Descartar celdas",
+            list(range(1, rows * cols + 1)),
+            key=f"sheet-skip-{form}",
+            help="Huecos vacíos o cartas que no quieras añadir (números de la vista previa).",
+        )
+        base_name = st.text_input(
+            "Nombre base",
+            placeholder="Por defecto, el del fichero",
+            help="Cada carta se llama «<nombre base> <número de celda>».",
+            key=f"sheet-name-{form}",
+        ).strip()
+        quantity = int(st.number_input("Copias de cada carta", min_value=1, value=1, key="sheet-qty"))
+        foil = st.checkbox("Foil", key="sheet-foil")
+
+    if uploaded is None and not url:
+        preview.caption("Sube una hoja o pega su URL para ver cómo se corta.")
+        return
+    try:
+        data = uploaded.getvalue() if uploaded is not None else _download_sheet(url)
+        preview.image(
+            _sheet_preview(data, rows, cols, margin, gap, tuple(skipped_cells)),
+            caption=f"{rows} × {cols} = {rows * cols} celdas",
+            width="stretch",
+        )
+    except ValueError as exc:
+        preview.error(str(exc))
+        return
+
+    if not settings.button("✂️ Dividir y añadir", type="primary", key="sheet-add"):
+        return
+    default_name = (
+        Path(uploaded.name).stem if uploaded is not None
+        else Path(unquote(urlparse(url).path)).stem
+    )
+    base_name = base_name or default_name or "Carta"
+    cards, problems = [], []
+    for number, cell in enumerate(_split_sheet(data, rows, cols, margin, gap), start=1):
+        if number in skipped_cells:
+            continue
+        try:
+            cards.append(_custom_card(cell, f"{base_name} {number}", quantity, foil, ctx))
+        except ValueError as exc:
+            problems.append(f"{number}: {exc}")
+    if not cards:
+        settings.error("\n\n".join(problems) or "Todas las celdas están descartadas.")
+        return
+    st.session_state.sheet_form = form + 1
+    _add_cards(ctx, deck_name, cards, problems)
+
+
+def _add_cards(
+    ctx: _Context, deck_name: str, cards: list[DeckCard], skipped: list[str] | None = None
+) -> None:
     with st.spinner("Buscando imágenes…"):
         added = _get_exporter(ctx).resolve_images(deck_name, cards)
     st.session_state.resolved.extend(added)
@@ -1049,12 +1318,17 @@ def _add_cards(ctx: _Context, deck_name: str, cards: list[DeckCard]) -> None:
     missing = sum(1 for item in added if item.front_path is None)
     names = added[0].card.name if len(added) == 1 else f"{len(added)} cartas"
     st.session_state.flash = f"Añadido: {names}"
-    if missing:
-        st.session_state.flash_warning = f"{missing} no encontrada(s): revisa «{FAILED_TAB}»."
+    warnings = [f"{missing} no encontrada(s): revisa «{FAILED_TAB}»."] if missing else []
+    if skipped:
+        warnings.append(f"{len(skipped)} imagen(es) descartada(s): " + "; ".join(skipped))
+    if warnings:
+        st.session_state.flash_warning = " ".join(warnings)
     st.rerun()
 
 
-def _render_pdf_actions(dpi: int | None, has_cards: bool) -> None:
+def _render_pdf_actions(
+    dpi: int | None, foil_tone: ToneAdjustment | None, has_cards: bool
+) -> None:
     resolved: list[ResolvedCard] = st.session_state.resolved
     ctx: _Context = st.session_state.context
     deck_name: str = st.session_state.deck_name
@@ -1064,7 +1338,7 @@ def _render_pdf_actions(dpi: int | None, has_cards: bool) -> None:
         try:
             quality = "calidad original" if dpi is None else f"{dpi} DPI"
             with st.spinner(f"Generando PDFs ({quality})…"):
-                pdfs = _get_exporter(ctx, dpi).render_pdfs(deck_name, resolved)
+                pdfs = _get_exporter(ctx, dpi, foil_tone).render_pdfs(deck_name, resolved)
             st.session_state.pdfs = pdfs + [_save_decklist(resolved, ctx, deck_name)]
         except Exception as exc:  # noqa: BLE001 - surface any failure in the UI
             logger.exception("PDF rendering failed")
@@ -1157,10 +1431,10 @@ def main() -> None:
     if flash_warning := st.session_state.pop("flash_warning", None):
         st.toast(flash_warning, icon="⚠️")
 
-    ctx, dpi = _render_sidebar()
+    ctx, dpi, foil_tone = _render_sidebar()
     _render_deck_input(ctx)
     if "resolved" in st.session_state:
-        _render_preview(ctx, dpi)
+        _render_preview(ctx, dpi, foil_tone)
         art_index = st.session_state.get("art_dialog")
         if art_index is not None and art_index < len(st.session_state.resolved):
             _art_dialog(art_index)

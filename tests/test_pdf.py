@@ -10,7 +10,7 @@ from PIL import Image
 from mocks import CARD_PNG, IMAGES_DIR, FakeStrategy
 from src.exporter import Exporter
 from src.models import DeckCard
-from src.pdf import PdfWriter, _png_idat, draw_image_ops
+from src.pdf import PdfWriter, ToneAdjustment, _png_idat, draw_image_ops
 
 
 def _write(tmp_path, image_path, size=None):
@@ -85,3 +85,46 @@ def test_exporter_embeds_source_pixels_by_default(tmp_path):
     assert pdf.count(b"/Subtype /Image") == 1  # nine copies share one image
     assert b"/Width 63 /Height 88" in pdf
     assert b"/MediaBox [0 0 595.2756 841.8898]" in pdf  # true A4 size
+
+
+def test_tone_adjustment_lightens_without_reversing_tones():
+    lut = ToneAdjustment(exposure=0.15, shadows=0.10, opacity=0.93).lut()
+
+    assert lut == sorted(lut)  # monotonic: no tone flips
+    assert lut[0] >= 0.10 * 255  # black is lifted to a dark grey
+    assert lut[255] == 255
+    assert all(after >= before for before, after in enumerate(lut))
+
+
+def test_neutral_tone_adjustment_keeps_the_pixels():
+    assert ToneAdjustment(exposure=0, shadows=0, opacity=1).lut() == list(range(256))
+
+
+def test_tone_adjustment_reencodes_losslessly(tmp_path):
+    writer = PdfWriter()
+    tone = ToneAdjustment()
+    name = writer.add_image(CARD_PNG, tone=tone)
+    assert writer.add_image(CARD_PNG, tone=tone) == name
+    writer.add_page(595.0, 842.0, draw_image_ops(name, (178.6, 0, 0, 249.4, 20, 20)))
+    writer.save(tmp_path / "out.pdf")
+    pdf = (tmp_path / "out.pdf").read_bytes()
+
+    stream = re.search(rb"/Columns 63 >> /Length (\d+) >>\nstream\n", pdf)
+    raw = zlib.decompress(pdf[stream.end() : stream.end() + int(stream.group(1))])
+    assert len(raw) == 88 * (1 + 63 * 3)  # full-size lossless RGB, not a JPEG
+    assert _png_idat(CARD_PNG.read_bytes()) not in pdf
+
+
+def test_exporter_lightens_only_the_foil_pdfs(tmp_path):
+    exporter = Exporter(FakeStrategy(), str(tmp_path), foil_tone=ToneAdjustment())
+    exporter.export_deck("deck", [
+        DeckCard(quantity=1, name="Bolt"),
+        DeckCard(quantity=1, name="Shock", foil=True),
+        DeckCard(quantity=1, name="Delver", back_name="Insectile", foil=True),
+    ])
+    idat = _png_idat(CARD_PNG.read_bytes())
+    deck_dir = tmp_path / "deck"
+
+    assert idat in (deck_dir / "deck.pdf").read_bytes()  # regular: untouched
+    for foil_pdf in ("foil_deck.pdf", "foil_front_deck.pdf", "foil_back_deck.pdf"):
+        assert idat not in (deck_dir / foil_pdf).read_bytes()

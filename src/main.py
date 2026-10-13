@@ -18,6 +18,7 @@ if __package__ in (None, ""):
 
 from src.exporter import Exporter
 from src.parser import parse_deck_file
+from src.pdf import ToneAdjustment
 from src.strategies.base import TCGStrategy
 from src.strategies.local import LocalStrategy
 from src.strategies.lorcana import LorcanaStrategy
@@ -86,12 +87,58 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--foil-lighten",
+        action="store_true",
+        help=(
+            "Lighten the images of the foil PDFs so the foil shows through: "
+            "more exposure, lifted shadows and lower opacity over white. "
+            "Tune it with --foil-exposure / --foil-shadows / --foil-opacity."
+        ),
+    )
+    defaults = ToneAdjustment()
+    parser.add_argument(
+        "--foil-exposure",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help=f"Foil exposure / brightness boost in %% (default {defaults.exposure:.0%}; implies --foil-lighten).",
+    )
+    parser.add_argument(
+        "--foil-shadows",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help=(
+            f"Foil shadow lift in %%: black becomes this grey (default {defaults.shadows:.0%}, "
+            "max 24; implies --foil-lighten)."
+        ),
+    )
+    parser.add_argument(
+        "--foil-opacity",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help=f"Foil image opacity over white in %% (default {defaults.opacity:.0%}; implies --foil-lighten).",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
         help="Enable verbose logging.",
     )
     return parser
+
+
+def _foil_tone(args: argparse.Namespace) -> ToneAdjustment | None:
+    """Tone curve for the foil PDFs from the ``--foil-*`` options (``None`` = off)."""
+    values = {
+        "exposure": args.foil_exposure,
+        "shadows": args.foil_shadows,
+        "opacity": args.foil_opacity,
+    }
+    if not args.foil_lighten and all(v is None for v in values.values()):
+        return None
+    return ToneAdjustment(**{key: v / 100 for key, v in values.items() if v is not None})
 
 
 _STRATEGY_REGISTRY: dict[str, type[TCGStrategy]] = {
@@ -158,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         strategy=strategy,
         output_base_dir=args.output + f"/{args.tcg}",
         target_dpi=args.dpi,
+        foil_tone=_foil_tone(args),
         # Cards under a '[lorcana]' / '[local]' ... section use that game.
         strategy_factory=lambda tcg: _make_strategy(tcg, args.local_dir, args.mpc_url),
     )

@@ -9,7 +9,7 @@ pytest.importorskip("streamlit")
 from streamlit.testing.v1 import AppTest
 
 from mocks import CARD_BACK_PNG, CARD_PNG, IMAGES_DIR, FakeStrategy, deck
-from src.app import FAILED_TAB, PDF_GROUPS, _zip_files
+from src.app import FAILED_TAB, PDF_GROUPS, _sheet_cells, _split_sheet, _zip_files
 from src.exporter import Exporter
 from src.models import ArtOption, DeckCard
 from src.parser import parse_deck_text
@@ -444,7 +444,7 @@ def test_add_card_with_an_own_image(tmp_path, monkeypatch):
     _serve_image(monkeypatch, CARD_BACK_PNG)
     at = _resolve_local_deck(tmp_path, "1 Pikachu", images_dir=images)
 
-    next(t for t in at.text_input if t.label == "…o URL de la imagen").input("https://example.com/x.png")
+    _custom_urls(at).input("https://example.com/x.png")
     next(t for t in at.text_input if t.label == "Nombre" and not t.value).input("Mi token")
     [b for b in at.button if b.label == "➕ Añadir"][1].click().run()
 
@@ -453,6 +453,37 @@ def test_add_card_with_an_own_image(tmp_path, monkeypatch):
     assert card.card.name == "Mi token" and card.card.art.startswith("file:Mi token-")
     assert card.front_path.read_bytes() == CARD_BACK_PNG.read_bytes()
     assert (images / card.card.art.removeprefix("file:")).exists()
+
+
+def _custom_urls(at):
+    return next(t for t in at.text_area if t.label.startswith("…o URLs"))
+
+
+def test_add_several_own_images_at_once(tmp_path, monkeypatch):
+    images = _own_images_dir(tmp_path)
+    _serve_image(monkeypatch, CARD_BACK_PNG)
+    at = _resolve_local_deck(tmp_path, "1 Pikachu", images_dir=images)
+
+    _custom_urls(at).input("https://example.com/a/Token%201.png\n\nhttps://example.com/elf.jpg\n")
+    at.number_input[0].set_value(2)
+    [b for b in at.button if b.label == "➕ Añadir"][1].click().run()
+
+    assert not at.exception
+    added = at.session_state.resolved[1:]
+    assert [(r.card.name, r.card.quantity) for r in added] == [("Token 1", 2), ("elf", 2)]
+    assert all(r.card.art.startswith("file:") and r.front_path is not None for r in added)
+
+
+def test_name_needs_a_single_own_image(tmp_path, monkeypatch):
+    _serve_image(monkeypatch, CARD_BACK_PNG)
+    at = _resolve_local_deck(tmp_path, "1 Pikachu", images_dir=_own_images_dir(tmp_path))
+
+    _custom_urls(at).input("https://example.com/a.png\nhttps://example.com/b.png")
+    next(t for t in at.text_input if t.label == "Nombre" and not t.value).input("Mi token")
+    [b for b in at.button if b.label == "➕ Añadir"][1].click().run()
+
+    assert len(at.session_state.resolved) == 1
+    assert any("única imagen" in e.value for e in at.error)
 
 
 def test_art_picker_accepts_an_own_image(tmp_path, monkeypatch):
@@ -485,3 +516,107 @@ def test_edit_moves_a_card_to_another_game(tmp_path):
     assert not at.exception
     item = at.session_state.resolved[1]
     assert item.card.tcg == "lorcana" and item.front_path is not None
+
+
+def test_foil_lightening_is_passed_to_the_exporter(tmp_path, monkeypatch):
+    seen = []
+    original = Exporter.render_pdfs
+
+    def spy(self, deck_name, resolved):
+        seen.append(self.foil_tone)
+        return original(self, deck_name, resolved)
+
+    monkeypatch.setattr(Exporter, "render_pdfs", spy)
+    at = _resolve_local_deck(tmp_path, "1 Pikachu *F*")
+    at.sidebar.checkbox[0].check().run()
+    at.sidebar.slider[0].set_value(20).run()
+
+    _button(at, "Generar PDFs").click().run()
+
+    assert not at.exception
+    assert seen[-1] is not None and seen[-1].exposure == pytest.approx(0.20)
+
+
+SHEET_COLORS = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255), (255, 0, 255)]
+
+
+def _sheet_png(path: Path, rows: int = 2, cols: int = 3, cell=(63, 88), gap: int = 0) -> Path:
+    """Sheet with one plain colour per card (left to right, top to bottom)."""
+    import io
+
+    from PIL import Image
+
+    width, height = cell
+    size = (cols * width + (cols - 1) * gap, rows * height + (rows - 1) * gap)
+    sheet = Image.new("RGB", size, "white")
+    for index in range(rows * cols):
+        row, col = divmod(index, cols)
+        left, top = col * (width + gap), row * (height + gap)
+        sheet.paste(SHEET_COLORS[index], (left, top, left + width, top + height))
+    buffer = io.BytesIO()
+    sheet.save(buffer, "PNG")
+    path.write_bytes(buffer.getvalue())
+    return path
+
+
+def _cell_colors(cells: list[bytes]) -> list[tuple]:
+    import io
+
+    from PIL import Image
+
+    images = [Image.open(io.BytesIO(cell)) for cell in cells]
+    assert {img.size for img in images} == {(63, 88)}
+    # Every pixel has the cell colour: nothing of the neighbours or the gap.
+    colors = [img.getextrema() for img in images]
+    assert all(low == high for bands in colors for low, high in bands)
+    return [tuple(low for low, _ in bands) for bands in colors]
+
+
+def test_split_sheet_cuts_cells_in_reading_order(tmp_path):
+    cells = _split_sheet(_sheet_png(tmp_path / "s.png").read_bytes(), rows=2, cols=3)
+
+    assert _cell_colors(cells) == SHEET_COLORS
+
+
+def test_split_sheet_drops_margin_and_gap(tmp_path):
+    from PIL import Image, ImageOps
+
+    sheet = _sheet_png(tmp_path / "s.png", gap=10)
+    ImageOps.expand(Image.open(sheet), border=7, fill="white").save(sheet)
+
+    cells = _split_sheet(sheet.read_bytes(), rows=2, cols=3, margin=7, gap=10)
+
+    assert _cell_colors(cells) == SHEET_COLORS
+
+
+def test_sheet_cells_reject_a_grid_without_room():
+    with pytest.raises(ValueError):
+        _sheet_cells((100, 100), rows=2, cols=2, margin=50)
+
+
+def test_split_sheet_into_own_cards(tmp_path, monkeypatch):
+    images = _own_images_dir(tmp_path)
+    _serve_image(monkeypatch, _sheet_png(tmp_path / "sheet.png"))
+    at = _resolve_local_deck(tmp_path, "1 Pikachu", images_dir=images)
+
+    at.text_input(key="sheet-url-0").input("https://example.com/hojas/Code%20Lyoko.png")
+    at.number_input(key="sheet-rows").set_value(2)
+    at.number_input(key="sheet-cols").set_value(3).run()
+    assert not at.exception and not at.error
+    assert not any("Sube una hoja" in c.value for c in at.caption)
+    at.multiselect(key="sheet-skip-0").set_value([5])
+    at.number_input(key="sheet-qty").set_value(2)
+    at.button(key="sheet-add").click().run()
+
+    assert not at.exception
+    added = at.session_state.resolved[1:]
+    assert [(r.card.name, r.card.quantity) for r in added] == [
+        ("Code Lyoko 1", 2), ("Code Lyoko 2", 2), ("Code Lyoko 3", 2),
+        ("Code Lyoko 4", 2), ("Code Lyoko 6", 2),
+    ]
+    assert all(r.card.art.startswith("file:Code Lyoko") for r in added)
+    assert _cell_colors([r.front_path.read_bytes() for r in added]) == [
+        c for i, c in enumerate(SHEET_COLORS) if i != 4
+    ]
+    # The inputs are cleared for the next sheet.
+    assert at.text_input(key="sheet-url-1").value == ""

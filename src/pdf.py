@@ -14,6 +14,8 @@ Image encoding (lossless with respect to the downloaded file):
       in memory first).
     - Cards resampled to an explicit size (draft DPI) are re-encoded as
       high-quality JPEG to keep those files small.
+    - Cards with a :class:`ToneAdjustment` (lighter foil prints) are
+      re-encoded losslessly as PNG (JPEG when also resampled).
 """
 from __future__ import annotations
 
@@ -21,12 +23,55 @@ import io
 import struct
 import zlib
 from pathlib import Path
+from typing import NamedTuple
 
 from PIL import Image
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # JPEG quality for cards resampled to an explicit DPI (drafts, smaller files).
 RESAMPLED_JPEG_QUALITY = 95
+# Largest shadow lift that keeps the tone curve monotonic (see ToneAdjustment).
+MAX_SHADOW_LIFT = 0.24
+
+
+class ToneAdjustment(NamedTuple):
+    """Tone curve that lightens a card printed on foil / holographic stock.
+
+    Ink on foil looks darker than on screen and dark areas hide the foil,
+    so the image is "burnt" on purpose. The steps are applied in order:
+
+    Attributes:
+        exposure: Exposure / brightness gain (``0.15`` = +15 %): every
+            value is multiplied by ``1 + exposure`` (clipped to white).
+        shadows: Shadow lift as in Levels / Curves (``0.10`` = pure black
+            becomes 10 % grey). It fades out towards the highlights
+            (``+shadows * (1 - v)^4``), so dark greys and browns stop
+            turning into solid black while midtones barely move. Capped at
+            :data:`MAX_SHADOW_LIFT`.
+        opacity: Layer opacity over white paper (``0.93`` = 93 %): blends
+            the result with white, lightening every tone evenly.
+    """
+
+    exposure: float = 0.15
+    shadows: float = 0.10
+    opacity: float = 0.93
+
+    def lut(self) -> list[int]:
+        """256-entry lookup table mapping each 8-bit channel value."""
+        gain = 1.0 + max(0.0, self.exposure)
+        lift = min(max(0.0, self.shadows), MAX_SHADOW_LIFT)
+        opacity = min(max(0.0, self.opacity), 1.0)
+        table: list[int] = []
+        for value in range(256):
+            v = min(1.0, value / 255 * gain)
+            v += lift * (1.0 - v) ** 4
+            v = v * opacity + (1.0 - opacity)
+            table.append(round(min(1.0, v) * 255))
+        return table
+
+    def apply(self, image: Image.Image) -> Image.Image:
+        """``image`` as RGB with the curve applied to every channel."""
+        return image.convert("RGB").point(self.lut() * 3)
 
 
 class PdfWriter:
@@ -38,26 +83,34 @@ class PdfWriter:
         self._page_refs: list[int] = []
         # Resource name -> object number, and source key -> resource name.
         self._image_refs: dict[str, int] = {}
-        self._image_names: dict[tuple[str, tuple[int, int] | None], str] = {}
+        self._image_names: dict[
+            tuple[str, tuple[int, int] | None, ToneAdjustment | None], str
+        ] = {}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def add_image(self, path: Path, size: tuple[int, int] | None = None) -> str:
+    def add_image(
+        self,
+        path: Path,
+        size: tuple[int, int] | None = None,
+        tone: ToneAdjustment | None = None,
+    ) -> str:
         """Embed an image once and return its resource name (e.g. ``Im1``).
 
         Args:
             path: Image file on disk.
             size: Optional ``(width, height)`` in pixels to resample to;
                 ``None`` keeps the source pixels untouched.
+            tone: Optional tone curve applied to the pixels (foil prints).
 
         Returns:
             The XObject name to draw with :func:`draw_image_ops`.
         """
-        key = (str(path), size)
+        key = (str(path), size, tone)
         if key not in self._image_names:
             name = f"Im{len(self._image_names) + 1}"
-            self._image_refs[name] = self._add_object(_image_object(path, size))
+            self._image_refs[name] = self._add_object(_image_object(path, size, tone))
             self._image_names[key] = name
         return self._image_names[key]
 
@@ -149,13 +202,26 @@ def _stream(header: bytes, data: bytes) -> bytes:
     return b"<< " + header + b" >>\nstream\n" + data + b"\nendstream"
 
 
-def _image_object(path: Path, size: tuple[int, int] | None) -> bytes:
-    """Image XObject for ``path``, reusing the file's own compressed data."""
+def _image_object(
+    path: Path,
+    size: tuple[int, int] | None,
+    tone: ToneAdjustment | None = None,
+) -> bytes:
+    """Image XObject for ``path``, reusing the file's own compressed data.
+
+    A ``tone`` curve changes the pixels, so the image is re-encoded:
+    lossless PNG at source size, JPEG when resampled.
+    """
     with Image.open(path) as src:
         src.load()
-        if size is not None and src.size != size:
+        resample = size is not None and src.size != size
+        if tone is not None and not resample:
+            return _png_image_object(tone.apply(src))
+        if resample:
             # Resampled drafts favor size: high-quality JPEG, no chroma subsampling.
             image = src.convert("RGB").resize(size, Image.LANCZOS)
+            if tone is not None:
+                image = tone.apply(image)
             buffer = io.BytesIO()
             image.save(buffer, "JPEG", quality=RESAMPLED_JPEG_QUALITY, subsampling=0)
             return _jpeg_image_object(buffer.getvalue(), size, "RGB")
